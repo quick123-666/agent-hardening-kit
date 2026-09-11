@@ -174,6 +174,12 @@ See [examples/extensions/README.md](./examples/extensions/README.md) for complet
 - 📖 [Getting Started](./docs/getting-started.md) — Quick start guide
 - 🔧 [API Reference](./docs/api-reference.md) — Detailed API documentation
 - 💡 [Best Practices](./docs/best-practices.md) — Recommended patterns
+- 🛡️ [Security Test Summary](./docs/SECURITY-TEST-SUMMARY.md) — **208 tests, 100% pass**
+  - [R1 Report](./docs/SECURITY-TEST-REPORT.md) — Core threats (17 tests)
+  - [R2 Report](./docs/SECURITY-TEST-R2.md) — Boundary stress (41 tests)
+  - [R3 Report](./docs/SECURITY-TEST-R3.md) — Advanced adversarial (41 tests)
+  - [R4 Report](./docs/SECURITY-TEST-R4.md) — Extreme adversarial (46 tests)
+  - [R5 Report](./docs/SECURITY-TEST-R5.md) — Zero-day + lateral (63 tests)
 - 🎓 [Pi Coding Agent Case Study](./examples/pi/README.md) — Complete example
 
 ---
