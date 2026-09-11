@@ -104,12 +104,67 @@ await Promise.all([security.init(), stability.init(), memory.init()]);
 
 ### Integration with Pi Coding Agent
 
+#### Core Principle: Direct Tool Registry Manipulation
+
+Unlike "writing 'don't use bash' in the prompt", we directly manipulate Pi's tool registry:
+
+```typescript
+// Remove bash from LLM's tool list entirely
+const active = pi.getActiveTools();
+const safeTools = active.filter(tool => tool !== "bash");
+pi.setActiveTools(safeTools);  // LLM cannot see bash
+```
+
+This is **3 layers of protection**:
+1. `setActiveTools()` — bash not in LLM's tool list
+2. `session_start` hook — auto-disable on every session
+3. `tool_call` interceptor — backup protection
+
+#### Load Configurations
+
 ```bash
-# Load all constraints
-pi \
-  -e ./examples/pi/pi-security-constraints.ts \
-  -e ./examples/pi/pi-stability-constraints.ts \
-  -e ./examples/pi/pi-memory.ts
+# ===== Maximum Security (disable all commands) =====
+pi -e ~/.pi/agent/extensions/pi-disable-bash.ts
+
+# ===== Database Protection =====
+pi -e ~/.pi/agent/extensions/pi-disable-bash.ts \
+   -e ~/.pi/agent/extensions/pi-no-delete-db.ts
+
+# ===== Complete Security + Mechanism Verify =====
+pi -e ~/.pi/agent/extensions/pi-disable-bash.ts \
+   -e ~/.pi/agent/extensions/pi-no-delete-db.ts \
+   -e ~/.pi/agent/extensions/pi-mechanism-verify.ts
+```
+
+#### Extension Examples
+
+See [examples/extensions/README.md](./examples/extensions/README.md) for complete documentation:
+
+| Extension | File | Function |
+|-----------|------|----------|
+| Disable Bash | `pi-disable-bash.ts` | Remove bash from tool list |
+| No Delete DB | `pi-no-delete-db.ts` | Block database deletion |
+| Mechanism Verify | `pi-mechanism-verify.ts` | Spike-First reminders |
+
+#### Available Commands
+
+```bash
+# Bash control
+/bash-status      # View bash tool status
+/allow-bash       # Temporarily enable bash
+/disable-bash     # Disable bash
+/list-tools       # List all available tools
+
+# Database protection
+/no-delete-db status
+/no-delete-db list
+/no-delete-db allow <pattern>
+/no-delete-db block <pattern>
+
+# Mechanism verify
+/spike <topic>           # Generate spike verification script
+/verify <topic> [risk]  # Mark mechanism as verified
+/mechanism-status        # View verified mechanisms
 ```
 
 ---
@@ -170,20 +225,26 @@ agent-hardening-kit/
 │   ├── base-extension.ts    # Extension base class
 │   └── index.ts             # Entry point
 ├── constraints/             # Constraint implementations
-├── extensions/              # Extension modules
 ├── examples/
-│   └── pi/                  # Pi Coding Agent case study
+│   ├── pi/                  # Pi Coding Agent case study
+│   │   ├── README.md
+│   │   ├── PHASE-2-PLAN.md
+│   │   ├── pi-security-constraints.ts
+│   │   ├── pi-stability-constraints.ts
+│   │   └── pi-memory.ts
+│   └── extensions/          # Ready-to-use extensions
 │       ├── README.md
-│       ├── PHASE-2-PLAN.md
-│       ├── pi-security-constraints.ts
-│       ├── pi-stability-constraints.ts
-│       └── pi-memory.ts
+│       ├── pi-disable-bash.ts      # 🔴 Disable bash tool
+│       ├── pi-no-delete-db.ts      # Database deletion protection
+│       └── pi-mechanism-verify.ts  # Spike-First reminders
 ├── config/
 │   └── default.json         # Default configuration
 ├── docs/                    # Documentation
 │   ├── getting-started.md
 │   ├── api-reference.md
 │   └── best-practices.md
+├── scripts/                 # Load scripts
+│   └── load-extensions.sh   # Profile-based extension loader
 ├── README.md                # English
 ├── README.zh.md             # 简体中文
 ├── README.ja.md             # 日本語
@@ -209,11 +270,12 @@ Contributions are welcome! Please read our [Contributing Guidelines](./CONTRIBUT
 
 ## 📊 Statistics
 
-- **Lines of Code**: ~3,000+
-- **Constraint Modules**: 10+
+- **Lines of Code**: ~5,000+
+- **Extensions**: 3 production-ready + 2 planned
 - **Supported AI Agents**: Pi Coding Agent (more coming)
 - **Bug Patterns Detected**: 15+
 - **Languages**: TypeScript
+- **Protection Layers**: 3 (setActiveTools, session_start hook, tool_call interceptor)
 
 ---
 
