@@ -1,0 +1,58 @@
+{
+  "security": {
+    "enabled": true,
+    "strict": true,
+    "allowedPaths": [
+      "/c/Users/Administrator/Desktop",
+      "/c/Users/Administrator/Projects"
+    ],
+    "forbiddenPaths": [
+      "/c/Windows/System32",
+      "/c/Windows/System",
+      "/etc",
+      "/bin",
+      "/sbin"
+    ],
+    "dangerousCommands": [
+      "rm -rf /",
+      "rm -rf /*",
+      "format",
+      "chmod 777"
+    ],
+    "dangerousExtensions": [
+      ".exe",
+      ".dll",
+      ".bat",
+      ".ps1",
+      ".sh",
+      ".cmd"
+    ],
+    "commandWhitelist": [
+      "ls", "cat", "cd", "pwd", "mkdir",
+      "npm", "node", "git", "find", "grep"
+    ],
+    "confirmRequired": [
+      "del", "rm -rf", "format", "shutdown"
+    ]
+  },
+  "stability": {
+    "enabled": true,
+    "maxRounds": 15,
+    "warningAtRounds": 12,
+    "snapshotEnabled": true,
+    "snapshotDir": "./snapshots",
+    "noiseFilterEnabled": true
+  },
+  "delivery": {
+    "enabled": true,
+    "maxChangeFiles": 5,
+    "maxPolishRounds": 3,
+    "forceDelivery": true
+  },
+  "memory": {
+    "enabled": true,
+    "memoryDir": "./memory",
+    "autoObserveThreshold": 0.7,
+    "silentMode": false
+  }
+}

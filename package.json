@@ -1,0 +1,23 @@
+{
+  "name": "agent-hardening-kit",
+  "version": "1.0.0",
+  "description": "让 AI 编程 Agent 更安全、更稳定、更可靠",
+  "main": "core/index.js",
+  "types": "core/types.ts",
+  "scripts": {
+    "test": "jest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint core/ constraints/ extensions/"
+  },
+  "keywords": [
+    "ai-agent",
+    "coding-agent",
+    "security",
+    "guardrails",
+    "hardening",
+    "pi-coding-agent",
+    "claude-code"
+  ],
+  "author": "",
+  "license": "MIT"
+}
