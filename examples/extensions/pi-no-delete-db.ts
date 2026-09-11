@@ -190,16 +190,26 @@ const DEFAULT_WHITELIST = [
 // ============================================================
 
 const DEFAULT_PROTECTED_PATHS = [
-  // Milvus
-  "C:/Users/Administrator/Desktop/milvus-cluster-deployment",
-  // 用户桌面项目目录
-  "D:/001",
+  // SSH 密钥和认证文件
+  "C:/Users/Administrator/.ssh",
+  "/home/.ssh",
+  "/root/.ssh",
+  // 系统配置
+  "C:/Users/Administrator/.aws",
+  "C:/Users/Administrator/.kube",
+  "C:/Windows/System32",
+  "/etc/ssh",
+  "/etc/nginx",
   // 数据库默认位置
   "/var/lib/mysql",
   "/var/lib/postgresql",
   "/var/lib/mongodb",
   "/var/lib/redis",
   "/var/lib/milvus",
+  // Milvus
+  "C:/Users/Administrator/Desktop/milvus-cluster-deployment",
+  // 用户桌面项目目录
+  "D:/001",
 ];
 
 // ============================================================
