@@ -185,6 +185,105 @@ function isSensitivePath(filePath: string): { sensitive: boolean; reason?: strin
 }
 
 // ============================================================
+// 持久化路径检测（R3）
+// ============================================================
+
+function isPersistencePath(filePath: string): { persistence: boolean; reason?: string } {
+  const normalized = (filePath || "").toLowerCase();
+  const withSlashes = normalized.replace(/\\/g, "/");
+
+  // 持久化路径检测
+  const persistencePatterns = [
+    { pattern: /\.bashrc/gi, reason: "Bash 启动脚本" },
+    { pattern: /\.bash_profile/gi, reason: "Bash profile" },
+    { pattern: /\.zshrc/gi, reason: "Zsh 启动脚本" },
+    { pattern: /\.profile/gi, reason: "Shell profile" },
+    { pattern: /\/etc\/profile/gi, reason: "系统 shell profile" },
+    { pattern: /\bcrontab\b/gi, reason: "Crontab 操作" },
+    { pattern: /\/etc\/cron\./gi, reason: "系统 cron 目录" },
+    { pattern: /\/etc\/systemd\/system/gi, reason: "Systemd 系统服务" },
+    { pattern: /\/etc\/init\.d/gi, reason: "SysVinit 脚本" },
+    { pattern: /LaunchDaemons/gi, reason: "macOS Launch Daemon" },
+    { pattern: /HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run/gi, reason: "Windows Run 键" },
+    { pattern: /HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run/gi, reason: "Windows Run 键" },
+    { pattern: /\breg\s+add\b.*\\Run\b/gi, reason: "reg add Run 键" },
+    { pattern: /\.config\/systemd\/user/gi, reason: "用户 systemd" },
+    { pattern: /\.config\/autostart/gi, reason: "XDG autostart" },
+  ];
+
+  for (const p of persistencePatterns) {
+    if (p.pattern.test(normalized) || p.pattern.test(withSlashes)) {
+      return { persistence: true, reason: p.reason };
+    }
+  }
+  return { persistence: false };
+}
+
+// ============================================================
+// 环境变量注入检测（R3）
+// ============================================================
+
+function hasEnvInjection(command: string): { detected: boolean; reason?: string } {
+  const envPatterns = [
+    { pattern: /LD_PRELOAD\s*=/gi, reason: "LD_PRELOAD 注入" },
+    { pattern: /LD_LIBRARY_PATH\s*=/gi, reason: "LD_LIBRARY_PATH 劫持" },
+    { pattern: /export\s+PATH\s*=.*:/gi, reason: "PATH 覆盖" },
+    { pattern: /PYTHONPATH\s*=/gi, reason: "PYTHONPATH 注入" },
+    { pattern: /NODE_OPTIONS\s*=.*--require/gi, reason: "Node --require 注入" },
+    { pattern: /IFS\s*=\s*['"`]/gi, reason: "IFS 变量劫持" },
+    { pattern: /BASH_ENV\s*=/gi, reason: "BASH_ENV 劫持" },
+  ];
+
+  for (const p of envPatterns) {
+    if (p.pattern.test(command)) {
+      return { detected: true, reason: p.reason };
+    }
+  }
+  return { detected: false };
+}
+
+// ============================================================
+// 高级恶意内容检测（R3）
+// ============================================================
+
+function hasAdvancedMalicious(content: string): { detected: boolean; reason?: string } {
+  const advancedPatterns = [
+    { pattern: /<\?php.*eval\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/gi, reason: "PHP 一句话 webshell" },
+    { pattern: /<\?php.*system\s*\(\s*\$_(GET|POST|REQUEST)/gi, reason: "PHP system webshell" },
+    { pattern: /eval\s*\(\s*atob\s*\(/gi, reason: "JS eval+atob" },
+    { pattern: /eval\s*\(\s*String\.fromCharCode/gi, reason: "JS eval+fromCharCode" },
+    { pattern: /pickle\.loads?\s*\(/gi, reason: "Python pickle 反序列化" },
+    { pattern: /yaml\.load\s*\([^,)]*(?!\s*Loader)/gi, reason: "Python yaml.load 不安全" },
+    { pattern: /Runtime\.getRuntime\(\)\.exec/gi, reason: "Java Runtime.exec" },
+    { pattern: /xmrig|minerd|stratum\+tcp:\/\//gi, reason: "挖矿特征" },
+    { pattern: /mimikatz/gi, reason: "Mimikatz 凭证窃取" },
+    { pattern: /powershell.*-enc/gi, reason: "PowerShell 编码命令" },
+  ];
+
+  // 直接匹配
+  for (const p of advancedPatterns) {
+    if (p.pattern.test(content)) {
+      return { detected: true, reason: p.reason };
+    }
+  }
+
+  // Base64 解码后匹配
+  const base64Matches = content.match(/[A-Za-z0-9+/]{20,}={0,2}/g) || [];
+  for (const b64 of base64Matches) {
+    try {
+      const decoded = Buffer.from(b64, "base64").toString("utf-8");
+      for (const p of advancedPatterns) {
+        if (p.pattern.test(decoded)) {
+          return { detected: true, reason: `${p.reason} (Base64 解码后)` };
+        }
+      }
+    } catch {}
+  }
+
+  return { detected: false };
+}
+
+// ============================================================
 // 日志
 // ============================================================
 
