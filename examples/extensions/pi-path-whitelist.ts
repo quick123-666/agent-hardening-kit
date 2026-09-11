@@ -40,6 +40,10 @@ interface PathWhitelistConfig {
   logAll: boolean;
   /** 日志文件 */
   logFile: string;
+  /** 恶意内容日志文件（独立） */
+  maliciousLogFile: string;
+  /** 恶意内容告警：true=仅告警，false=拒绝写入（严格模式） */
+  maliciousWarnOnly: boolean;
 }
 
 function getHomeDir(): string {
@@ -53,6 +57,8 @@ const DEFAULT_CONFIG: PathWhitelistConfig = {
   warnOnly: false,
   logAll: false,
   logFile: path.join(os.homedir(), ".pi", "agent", "logs", "path-whitelist.log"),
+  maliciousLogFile: path.join(os.homedir(), ".pi", "agent", "logs", "malicious-content.log"),
+  maliciousWarnOnly: true,
 };
 
 // ============================================================
@@ -155,6 +161,32 @@ function log(config: PathWhitelistConfig, tool: string, path: string, allowed: b
     const reasonStr = reason ? ` (${reason})` : "";
     const line = `[${timestamp}] [${status}] ${tool}: ${path}${reasonStr}\n`;
     fs.appendFileSync(config.logFile, line, "utf-8");
+  } catch {
+    // 忽略日志错误
+  }
+}
+
+function logMaliciousContent(
+  config: PathWhitelistConfig,
+  tool: string,
+  filePath: string,
+  reasons: string[],
+  snippets: string[]
+) {
+  if (!config.maliciousLogFile) return;
+  try {
+    const dir = path.dirname(config.maliciousLogFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] [${tool}] File: ${filePath}\n` +
+      `  检测到特征:\n${reasons.map((r) => `    - ${r}`).join("\n")}\n` +
+      (snippets.length > 0
+        ? `  匹配片段:\n${snippets.map((s) => `    \`${s.slice(0, 80)}\``).join("\n")}\n`
+        : "") +
+      `  处置: ${config.maliciousWarnOnly ? "告警仅记录" : "拦截写入"}\n\n`;
+    fs.appendFileSync(config.maliciousLogFile, line, "utf-8");
   } catch {
     // 忽略日志错误
   }
@@ -268,7 +300,7 @@ export default function (pi: ExtensionAPI) {
   // 拦截文件写入（检查恶意内容）
   // ============================================================
 
-  pi.on("tool_result", async (event, ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
     const toolName = event.toolName;
     const params = event.input || {};
 
@@ -298,23 +330,65 @@ export default function (pi: ExtensionAPI) {
       { pattern: /;\s*rm\s+-rf/gi, reason: "命令注入 + 删除" },
     ];
 
+    const matchedReasons: string[] = [];
+    const matchedSnippets: string[] = [];
     for (const { pattern, reason } of maliciousPatterns) {
-      if (pattern.test(content)) {
-        log(config, toolName, params.path || "unknown", false, `恶意内容: ${reason}`);
-
-        ctx.ui.notify(
-          `🚨 [PathWhitelist] 检测到恶意内容\n\n` +
-            `文件: ${params.path || "unknown"}\n` +
-            `原因: ${reason}\n\n` +
-            `内容已写入，但已被标记。\n` +
-            `请检查代码是否安全。`,
-          "warning"
-        );
-
-        // 不阻止写入，但发出警告
-        return;
+      const match = content.match(pattern);
+      if (match) {
+        matchedReasons.push(reason);
+        if (matchedSnippets.length < 3) {
+          matchedSnippets.push(match[0]);
+        }
       }
     }
+
+    if (matchedReasons.length === 0) {
+      return;
+    }
+
+    const filePath = params.path || params.file_path || "unknown";
+
+    // 严格模式：拦截写入
+    if (!config.maliciousWarnOnly) {
+      logMaliciousContent(config, toolName, filePath, matchedReasons, matchedSnippets);
+
+      ctx.ui.notify(
+        `🚨 [PathWhitelist] 严格模式：拒绝写入恶意内容\n\n` +
+          `文件: ${filePath}\n` +
+          `检测到特征:\n${matchedReasons.map((r) => `  - ${r}`).join("\n")}\n` +
+          (matchedSnippets.length > 0
+            ? `\n匹配片段:\n${matchedSnippets.map((s) => `  \`${s}\``).join("\n")}\n`
+            : "") +
+          `\n❌ 写入已被拒绝。\n` +
+          `日志: ${config.maliciousLogFile}\n\n` +
+          `如需确认是合法代码，请使用警告模式：\n` +
+          `  /path-whitelist-strict disable`,
+        "error"
+      );
+
+      event.preventDefault?.();
+      return { allowed: false };
+    }
+
+    // 警告模式：记录但不拦截
+    logMaliciousContent(config, toolName, filePath, matchedReasons, matchedSnippets);
+
+    ctx.ui.notify(
+      `🚨 [PathWhitelist] 检测到恶意内容特征\n\n` +
+        `文件: ${filePath}\n` +
+        `检测到特征:\n${matchedReasons.map((r) => `  - ${r}`).join("\n")}\n` +
+        (matchedSnippets.length > 0
+          ? `\n匹配片段:\n${matchedSnippets.map((s) => `  \`${s}\``).join("\n")}\n`
+          : "") +
+        `\n⚠️ 写入未阻断，但已记录警告。\n` +
+        `日志: ${config.maliciousLogFile}\n\n` +
+        `如需严格模式（拒绝写入），请使用：\n` +
+        `  /path-whitelist-strict enable`,
+      "warning"
+    );
+
+    // 不阻止写入，只发出警告
+    return;
   });
 
   // ============================================================
@@ -471,6 +545,93 @@ export default function (pi: ExtensionAPI) {
           },
         ],
       };
+    },
+  });
+
+  // 恶意内容严格模式
+  pi.registerCommand({
+    name: "path-whitelist-strict",
+    description: "切换恶意内容严格模式（拒绝写入 vs 仅告警）",
+    async execute(ctx) {
+      const args = ctx.args || [];
+      if (args.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `当前模式: ${config.maliciousWarnOnly ? "警告模式（仅告警）" : "严格模式（拒绝写入）"}\n\n` +
+                `用法:\n` +
+                `  /path-whitelist-strict enable  - 启用严格模式\n` +
+                `  /path-whitelist-strict disable - 禁用严格模式（仅告警）`,
+            },
+          ],
+        };
+      }
+
+      const action = args[0].toLowerCase();
+      if (action === "enable") {
+        config.maliciousWarnOnly = false;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `🚨 已启用严格模式\n\n恶意内容写入将被拦截。\n⚠️ 谨慎使用：会误杀代码示例、注释等。`,
+            },
+          ],
+        };
+      } else if (action === "disable") {
+        config.maliciousWarnOnly = true;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ 已禁用严格模式\n\n当前为警告模式：恶意内容仅告警，不拦截写入。`,
+            },
+          ],
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `❌ 未知操作: ${action}\n\n用法:\n  /path-whitelist-strict enable|disable`,
+            },
+          ],
+        };
+      }
+    },
+  });
+
+  // 查看恶意内容日志
+  pi.registerCommand({
+    name: "path-whitelist-malicious-log",
+    description: "查看恶意内容告警日志（最近 10 条）",
+    async execute(ctx) {
+      if (!fs.existsSync(config.maliciousLogFile)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `ℹ️ 日志文件不存在: ${config.maliciousLogFile}\n\n尚未触发任何恶意内容告警。`,
+            },
+          ],
+        };
+      }
+
+      const content = fs.readFileSync(config.maliciousLogFile, "utf-8");
+      const entries = content.split("\n\n").filter(Boolean);
+      const recent = entries.slice(-10).reverse();
+
+      let message = `🚨 恶意内容告警日志（最近 ${recent.length} 条）\n\n`;
+      message += `日志文件: ${config.maliciousLogFile}\n`;
+      message += `总记录数: ${entries.length}\n\n`;
+      message += "─".repeat(50) + "\n\n";
+
+      recent.forEach((entry, i) => {
+        message += `${i + 1}. ${entry}\n\n`;
+      });
+
+      return { content: [{ type: "text", text: message }] };
     },
   });
 }
