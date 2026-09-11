@@ -258,6 +258,19 @@ function hasAdvancedMalicious(content: string): { detected: boolean; reason?: st
     { pattern: /xmrig|minerd|stratum\+tcp:\/\//gi, reason: "挖矿特征" },
     { pattern: /mimikatz/gi, reason: "Mimikatz 凭证窃取" },
     { pattern: /powershell.*-enc/gi, reason: "PowerShell 编码命令" },
+    // R4 元编程
+    { pattern: /!!python\/object/gi, reason: "YAML Python 对象反序列化" },
+    { pattern: /"__proto__"\s*:/gi, reason: "JSON prototype pollution" },
+    { pattern: /__reduce__|__subclasses__/gi, reason: "Python 反射魔术方法" },
+    // R4 网络下载
+    { pattern: /curl\s+[^|]*\|\s*(bash|sh|python|node)/gi, reason: "curl 下载执行" },
+    { pattern: /wget\s+[^|]*\|\s*(bash|sh|python|node)/gi, reason: "wget 下载执行" },
+    { pattern: /pip\s+install\s+.*git\+/gi, reason: "pip Git 安装" },
+    { pattern: /npm\s+install\s+.*git\+/gi, reason: "npm Git 安装" },
+    // R4 供应链
+    { pattern: /"postinstall"\s*:/gi, reason: "npm postinstall 脚本" },
+    { pattern: /"preinstall"\s*:/gi, reason: "npm preinstall 脚本" },
+    { pattern: /cmdclass\s*=/gi, reason: "setup.py cmdclass" },
   ];
 
   // 直接匹配
