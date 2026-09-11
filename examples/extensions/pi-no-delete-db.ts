@@ -147,6 +147,44 @@ const DANGEROUS_PATTERNS = [
     description: "清空 Redis 数据库",
   },
 
+  // 命令混淆
+  {
+    name: "rm 根目录",
+    pattern: /rm\s+-rf\s+\//gi,
+    severity: "critical",
+    description: "rm -rf / 递归删除根目录",
+  },
+  {
+    name: "dd 设备操作",
+    pattern: /\bdd\s+.*\b(of|if)=.*\/dev\//gi,
+    severity: "critical",
+    description: "dd 设备操作（可能破坏磁盘）",
+  },
+  {
+    name: "命令替换 $(...)",
+    pattern: /\$\(.*\b(rm|chmod|wget|curl)\b/gi,
+    severity: "critical",
+    description: "$() 命令替换",
+  },
+  {
+    name: "反引号命令替换",
+    pattern: /`\s*(rm|chmod|wget|curl)\b/gi,
+    severity: "critical",
+    description: "反引号命令替换",
+  },
+  {
+    name: "危险管道",
+    pattern: /\|\s*(bash|sh|nc|netcat|python|perl|ruby|php)\b/gi,
+    severity: "critical",
+    description: "管道到危险的解释器",
+  },
+  {
+    name: "命令注入（分号）",
+    pattern: /;\s*(rm|chmod|chown|dd|mkfs|wget|curl)\b/gi,
+    severity: "critical",
+    description: "分号命令注入",
+  },
+
   // 文件系统
   {
     name: "rm -rf 数据库目录",

@@ -92,9 +92,44 @@ function isPathAllowed(filePath: string, whitelist: string[]): { allowed: boolea
   };
 }
 
+function resolvePathTraversal(p: string): string {
+  const parts = p.split("/");
+  const resolved: string[] = [];
+  const isAbsolute = p.startsWith("/");
+  for (const part of parts) {
+    if (part === "..") {
+      if (resolved.length > 0 && resolved[resolved.length - 1] !== "") {
+        resolved.pop();
+      }
+    } else if (part !== "." && part !== "") {
+      resolved.push(part);
+    }
+  }
+  return (isAbsolute ? "/" : "") + resolved.join("/");
+}
+
+function resolveDotSegments(p: string): string {
+  const input = p.split("/");
+  const output: string[] = [];
+  for (const segment of input) {
+    if (segment === ".") {
+      continue;
+    } else if (segment === "..") {
+      if (output.length > 0 && output[output.length - 1] !== "") {
+        output.pop();
+      }
+    } else {
+      output.push(segment);
+    }
+  }
+  return output.join("/");
+}
+
 function isSensitivePath(filePath: string): { sensitive: boolean; reason?: string } {
   const normalized = normalizePath(filePath);
   const home = normalizePath(getHomeDir());
+
+  if (!normalized) return { sensitive: false };
 
   // 敏感路径列表
   const sensitivePatterns = [
@@ -127,17 +162,21 @@ function isSensitivePath(filePath: string): { sensitive: boolean; reason?: strin
     { pattern: "/appdata/roaming/", reason: "用户应用数据" },
   ];
 
+  // 先解析点段（./），再解析穿越（../）
+  const dotResolved = resolveDotSegments(normalized);
+  const resolved = resolvePathTraversal(dotResolved);
+
   // 首先检查是否在 home 目录外
-  if (!normalized.startsWith(home) && !normalized.startsWith("/home/") && !normalized.startsWith("/root/")) {
+  if (!resolved.startsWith(home) && !resolved.startsWith("/home/") && !resolved.startsWith("/root/")) {
     // 不在用户目录，检查系统目录
-    if (normalized.includes("/windows/") || normalized.includes("/etc/")) {
+    if (resolved.includes("/windows/") || resolved.includes("/etc/")) {
       return { sensitive: true, reason: "系统目录" };
     }
   }
 
-  // 检查敏感模式
+  // 检查敏感模式（同时检查原始和解析后路径）
   for (const { pattern, reason } of sensitivePatterns) {
-    if (normalized.includes(pattern.toLowerCase())) {
+    if (normalized.includes(pattern.toLowerCase()) || resolved.includes(pattern.toLowerCase())) {
       return { sensitive: true, reason };
     }
   }
@@ -318,16 +357,19 @@ export default function (pi: ExtensionAPI) {
     const maliciousPatterns = [
       { pattern: /eval\s*\(\s*base64_decode/gi, reason: "Base64 编码的 eval" },
       { pattern: /rm\s+-rf\s+\//gi, reason: "删除根目录" },
-      { pattern: /curl\s+\|\s*bash/gi, reason: "Pipe curl to bash" },
-      { pattern: /wget\s+.*\|\s*bash/gi, reason: "Pipe wget to bash" },
+      { pattern: /curl[^|]*\|\s*bash/gi, reason: "Pipe curl to bash" },
+      { pattern: /wget[^|]*\|\s*bash/gi, reason: "Pipe wget to bash" },
       { pattern: /nc\s+.*-e\s+/gi, reason: "Netcat 反向 shell" },
       { pattern: /bash\s+-i\s+>&.*\/dev\/tcp\//gi, reason: "Bash 反向 shell" },
-      { pattern: /\/dev\/tcp\//gi, reason: " Bash /dev/tcp shell" },
+      { pattern: /\/dev\/tcp\//gi, reason: "Bash /dev/tcp shell" },
       { pattern: /python.*-c.*import\s+socket/gi, reason: "Python 反向 shell" },
       { pattern: /php.*eval\s*\(\s*\$_/gi, reason: "PHP eval 注入" },
       { pattern: /DROP\s+TABLE/gi, reason: "DROP TABLE 注入" },
       { pattern: /DROP\s+DATABASE/gi, reason: "DROP DATABASE 注入" },
       { pattern: /;\s*rm\s+-rf/gi, reason: "命令注入 + 删除" },
+      { pattern: /echo\s+[A-Za-z0-9+/=]{10,}\s*\|\s*base64\s+-d\s*\|\s*(bash|sh|python)/gi, reason: "Base64 编码管道" },
+      { pattern: /__import__\s*\(\s*['"]os['"]\s*\)\s*\.\s*system/gi, reason: "Python __import__ os.system" },
+      { pattern: /subprocess\.(call|run|Popen)\s*\(.*shell\s*=\s*True/gi, reason: "subprocess shell=True" },
     ];
 
     const matchedReasons: string[] = [];
@@ -338,6 +380,24 @@ export default function (pi: ExtensionAPI) {
         matchedReasons.push(reason);
         if (matchedSnippets.length < 3) {
           matchedSnippets.push(match[0]);
+        }
+      }
+    }
+
+    // 去混淆检测：移除引号、反引号、多余空格后重新匹配
+    if (matchedReasons.length === 0) {
+      const cleaned = content
+        .replace(/["'`]+/g, "")  // 移除成对引号
+        .replace(/["']/g, "")  // 移除剩余单引号
+        .replace(/\s+/g, " ");  // 空格归一
+
+      for (const { pattern, reason } of maliciousPatterns) {
+        const match = cleaned.match(pattern);
+        if (match) {
+          matchedReasons.push(`${reason} (去混淆后)`);
+          if (matchedSnippets.length < 3) {
+            matchedSnippets.push(match[0]);
+          }
         }
       }
     }
