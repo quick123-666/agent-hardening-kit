@@ -271,6 +271,23 @@ function hasAdvancedMalicious(content: string): { detected: boolean; reason?: st
     { pattern: /"postinstall"\s*:/gi, reason: "npm postinstall 脚本" },
     { pattern: /"preinstall"\s*:/gi, reason: "npm preinstall 脚本" },
     { pattern: /cmdclass\s*=/gi, reason: "setup.py cmdclass" },
+    // R5 横向移动
+    { pattern: /ssh\s+[^|]*\.ssh\/id_rsa/gi, reason: "SSH 私钥横向" },
+    { pattern: /ansible\s+all\s+-m\s+/gi, reason: "Ansible 批量执行" },
+    { pattern: /salt\s+'\*'\s+cmd\.run/gi, reason: "SaltStack 批量" },
+    { pattern: /kubectl\s+exec\s+/gi, reason: "kubectl 远程执行" },
+    // R5 容器逃逸
+    { pattern: /\/var\/run\/docker\.sock/gi, reason: "Docker socket 访问" },
+    { pattern: /\/proc\/1\/root/gi, reason: "/proc/1/root 逃逸" },
+    { pattern: /CAP_SYS_ADMIN/gi, reason: "CAP_SYS_ADMIN 滥用" },
+    // R5 云环境
+    { pattern: /169\.254\.169\.254/gi, reason: "AWS metadata service" },
+    { pattern: /metadata\.google\.internal/gi, reason: "GCP metadata" },
+    { pattern: /\bAWS_SECRET_ACCESS_KEY\s*=/gi, reason: "AWS secret env var" },
+    // R5 零日漏洞
+    { pattern: /strcpy\s*\(\s*\w+\s*,\s*\w+\s*\)/gi, reason: "strcpy 缓冲区溢出" },
+    { pattern: /gets\s*\(\s*\w+\s*\)/gi, reason: "gets 缓冲区溢出" },
+    { pattern: /\bfree\s*\(\s*\w+\s*\)[\s\S]{0,20}\w+\s*\[/gi, reason: "Use After Free" },
   ];
 
   // 直接匹配
