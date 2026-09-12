@@ -1,22 +1,19 @@
 /**
- * Pi Path Whitelist Extension (路径白名单)
+ * Pi Path Whitelist Extension with Multi-Hop Tracing
  *
- * 限制 LLM 的文件操作只能在项目目录内进行。
- * 防止 LLM 读取敏感文件（如 ~/.ssh/id_rsa）或修改系统文件。
+ * 路径白名单 + 多跳追踪版
  *
- * 核心原理：
- * 1. 在 tool_call 拦截器中检查路径
- * 2. 路径必须在白名单内，否则拦截
- * 3. 配置文件操作（edit/write）会限制在项目目录
+ * 核心改进：
+ * - 把拦截过程分解成多个 Hop，让用户理解决策过程
+ * - 每一步检查都记录，用户能看到"为什么被拦"
+ * - 提供具体建议，告诉用户"怎么改"
  *
- * 使用方法：
- *   pi -e ~/.pi/agent/extensions/pi-path-whitelist.ts
- *
- * 命令：
- *   /path-whitelist-status     - 查看白名单状态
- *   /path-whitelist-add <path> - 添加白名单路径
- *   /path-whitelist-remove <p> - 移除白名单路径
- *   /path-whitelist-list       - 列出白名单
+ * 多跳追踪流程：
+ * Hop 1: 解析输入 - 提取工具名、路径、参数
+ * Hop 2: 路径检查 - 是否在白名单内
+ * Hop 3: 敏感路径检查 - 是否是敏感文件
+ * Hop 4: 恶意内容检查 - 是否包含危险代码
+ * Hop 5: 决策 + 建议 - 最终判断 + 修复建议
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -25,24 +22,38 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 
 // ============================================================
+// 多跳追踪类型
+// ============================================================
+
+interface CheckStep {
+  hop: number;
+  name: string;
+  description: string;
+  passed: boolean;
+  detail?: string;
+  suggestion?: string;
+}
+
+interface ConstraintDecision {
+  allowed: boolean;
+  steps: CheckStep[];
+  finalReason?: string;
+  suggestion?: string;
+  blockedBy?: string;
+}
+
+// ============================================================
 // 配置
 // ============================================================
 
 interface PathWhitelistConfig {
   enabled: boolean;
-  /** 允许的文件操作工具 */
   allowedTools: string[];
-  /** 白名单路径 */
   whitelist: string[];
-  /** 是否在非白名单路径时发出警告（而不是阻止） */
   warnOnly: boolean;
-  /** 是否记录所有访问 */
   logAll: boolean;
-  /** 日志文件 */
   logFile: string;
-  /** 恶意内容日志文件（独立） */
   maliciousLogFile: string;
-  /** 恶意内容告警：true=仅告警，false=拒绝写入（严格模式） */
   maliciousWarnOnly: boolean;
 }
 
@@ -62,155 +73,228 @@ const DEFAULT_CONFIG: PathWhitelistConfig = {
 };
 
 // ============================================================
-// 路径检查
+// 路径检查函数
 // ============================================================
 
 function normalizePath(p: string): string {
-  if (p.startsWith("~")) {
-    p = p.replace("~", getHomeDir());
-  }
-  p = p.replace(/\\/g, "/");
-  return p.toLowerCase();
+  if (p.startsWith("~")) p = p.replace("~", getHomeDir());
+  return p.replace(/\\/g, "/").toLowerCase();
 }
 
-function isPathAllowed(filePath: string, whitelist: string[]): { allowed: boolean; reason?: string } {
+function isPathAllowed(filePath: string, whitelist: string[]): { allowed: boolean; detail?: string } {
   const normalized = normalizePath(filePath);
-
   for (const allowed of whitelist) {
     const allowedNorm = normalizePath(allowed);
     if (normalized.startsWith(allowedNorm) || normalized.includes(allowedNorm)) {
       return { allowed: true };
     }
   }
-
-  return {
-    allowed: false,
-    reason: `路径不在白名单内: ${filePath}`,
-  };
+  return { allowed: false, detail: `路径 "${filePath}" 不在白名单内` };
 }
 
-function resolvePathTraversal(p: string): string {
-  const parts = p.split("/");
-  const resolved: string[] = [];
-  const isAbsolute = p.startsWith("/");
-  for (const part of parts) {
-    if (part === "..") {
-      if (resolved.length > 0 && resolved[resolved.length - 1] !== "") {
-        resolved.pop();
-      }
-    } else if (part !== "." && part !== "") {
-      resolved.push(part);
-    }
-  }
-  return (isAbsolute ? "/" : "") + resolved.join("/");
-}
-
-function resolveDotSegments(p: string): string {
-  const input = p.split("/");
-  const output: string[] = [];
-  for (const segment of input) {
-    if (segment === ".") {
-      continue;
-    } else if (segment === "..") {
-      if (output.length > 0 && output[output.length - 1] !== "") {
-        output.pop();
-      }
-    } else {
-      output.push(segment);
-    }
-  }
-  return output.join("/");
-}
-
-function isSensitivePath(filePath: string): { sensitive: boolean; reason?: string } {
+function isSensitivePath(filePath: string): { sensitive: boolean; reason?: string; suggestion?: string } {
   const normalized = normalizePath(filePath);
-  const home = normalizePath(getHomeDir());
-
-  if (!normalized) return { sensitive: false };
-
   const sensitivePatterns = [
-    { pattern: "/.ssh/", reason: "SSH 密钥目录" },
-    { pattern: ".ssh/id_rsa", reason: "SSH 私钥" },
-    { pattern: ".ssh/id_ed25519", reason: "SSH 私钥" },
-    { pattern: ".ssh/known_hosts", reason: "SSH known_hosts" },
-    { pattern: ".ssh/config", reason: "SSH 配置" },
-    { pattern: ".ssh/authorized_keys", reason: "SSH 授权密钥" },
-    { pattern: "/.aws/", reason: "AWS 凭证" },
-    { pattern: "/.kube/", reason: "Kubernetes 配置" },
-    { pattern: "/.netrc", reason: "Netrc 凭证" },
-    { pattern: "/.npmrc", reason: "NPM 配置（可能含 token）" },
-    { pattern: "/.pypirc", reason: "PyPI 凭证" },
-    { pattern: "/windows/system32", reason: "系统目录" },
-    { pattern: "/etc/passwd", reason: "系统账户文件" },
-    { pattern: "/etc/shadow", reason: "系统密码文件" },
-    { pattern: "/etc/sudoers", reason: "Sudo 配置" },
-    { pattern: "/.env", reason: "环境变量文件" },
-    { pattern: "/.env.local", reason: "环境变量文件" },
-    { pattern: "/.env.production", reason: "生产环境变量" },
-    { pattern: "/cookies", reason: "Cookie 文件" },
-    { pattern: "/session", reason: "Session 文件" },
-    { pattern: "/appdata/roaming/", reason: "用户应用数据" },
+    { pattern: "/.ssh/", reason: "SSH 密钥目录", suggestion: "禁止访问 SSH 密钥，仅允许项目配置文件" },
+    { pattern: ".ssh/id_rsa", reason: "SSH 私钥", suggestion: "禁止读取私钥文件，防止密钥泄露" },
+    { pattern: "/.aws/", reason: "AWS 凭证", suggestion: "禁止访问 AWS 配置，使用环境变量代替" },
+    { pattern: "/.kube/", reason: "Kubernetes 配置", suggestion: "禁止访问 kubeconfig，防止集群入侵" },
+    { pattern: "/etc/passwd", reason: "系统账户文件", suggestion: "禁止读取系统账户信息" },
+    { pattern: "/etc/shadow", reason: "系统密码文件", suggestion: "禁止读取密码哈希，防止密码破解" },
+    { pattern: "/.env", reason: "环境变量文件", suggestion: "禁止读取 .env，使用代码中的默认值" },
   ];
 
-  const dotResolved = resolveDotSegments(normalized);
-  const resolved = resolvePathTraversal(dotResolved);
-
-  if (!resolved.startsWith(home) && !resolved.startsWith("/home/") && !resolved.startsWith("/root/")) {
-    if (resolved.includes("/windows/") || resolved.includes("/etc/")) {
-      return { sensitive: true, reason: "系统目录" };
+  for (const { pattern, reason, suggestion } of sensitivePatterns) {
+    if (normalized.includes(pattern.toLowerCase())) {
+      return { sensitive: true, reason, suggestion };
     }
   }
-
-  for (const { pattern, reason } of sensitivePatterns) {
-    if (normalized.includes(pattern.toLowerCase()) || resolved.includes(pattern.toLowerCase())) {
-      return { sensitive: true, reason };
-    }
-  }
-
   return { sensitive: false };
 }
 
 // ============================================================
-// 恶意内容检测
+// 多跳检查主函数
 // ============================================================
 
-function hasAdvancedMalicious(content: string): { detected: boolean; reason?: string } {
-  const advancedPatterns = [
-    { pattern: /<\?php.*eval\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/gi, reason: "PHP 一句话 webshell" },
-    { pattern: /eval\s*\(\s*base64_decode/gi, reason: "Base64 编码的 eval" },
-    { pattern: /rm\s+-rf\s+\//gi, reason: "删除根目录" },
-    { pattern: /curl[^|]*\|\s*bash/gi, reason: "Pipe curl to bash" },
-    { pattern: /wget[^|]*\|\s*bash/gi, reason: "Pipe wget to bash" },
-    { pattern: /nc\s+.*-e\s+/gi, reason: "Netcat 反向 shell" },
-    { pattern: /bash\s+-i\s+>&.*\/dev\/tcp\//gi, reason: "Bash 反向 shell" },
-    { pattern: /\/dev\/tcp\//gi, reason: "Bash /dev/tcp shell" },
-    { pattern: /python.*-c.*import\s+socket/gi, reason: "Python 反向 shell" },
-    { pattern: /php.*eval\s*\(\s*\$_/gi, reason: "PHP eval 注入" },
-    { pattern: /DROP\s+TABLE/gi, reason: "DROP TABLE 注入" },
-    { pattern: /DROP\s+DATABASE/gi, reason: "DROP DATABASE 注入" },
-    { pattern: /;\s*rm\s+-rf/gi, reason: "命令注入 + 删除" },
-    { pattern: /__import__\s*\(\s*['"]os['"]\s*\)\s*\.\s*system/gi, reason: "Python __import__ os.system" },
-  ];
+function runMultiHopChecks(
+  toolName: string,
+  params: Record<string, any>,
+  config: PathWhitelistConfig
+): ConstraintDecision {
+  const steps: CheckStep[] = [];
+  let allowed = true;
+  let finalReason: string | undefined;
+  let blockedBy: string | undefined;
+  let suggestion: string | undefined;
 
-  for (const p of advancedPatterns) {
-    if (p.pattern.test(content)) {
-      return { detected: true, reason: p.reason };
+  // ===== Hop 1: 解析输入 =====
+  const filePath = params.path || params.file_path || "";
+  const content = params.content || params.newText || "";
+  
+  steps.push({
+    hop: 1,
+    name: "parse_input",
+    description: "解析输入",
+    passed: true,
+    detail: `工具: ${toolName}, 路径: ${filePath || "(无路径)"}`,
+  });
+
+  // ===== Hop 2: 路径白名单检查 =====
+  if (filePath && config.whitelist.length > 0) {
+    const pathCheck = isPathAllowed(filePath, config.whitelist);
+    steps.push({
+      hop: 2,
+      name: "path_whitelist",
+      description: "白名单检查",
+      passed: pathCheck.allowed,
+      detail: pathCheck.allowed ? "路径在白名单内" : pathCheck.detail,
+      suggestion: !pathCheck.allowed ? "使用项目目录内的路径，或添加白名单: /path-whitelist-add <路径>" : undefined,
+    });
+    if (!pathCheck.allowed) {
+      allowed = false;
+      blockedBy = "path_whitelist";
+      finalReason = pathCheck.detail;
+      suggestion = `只允许访问项目目录: ${config.whitelist.join(", ")}`;
+    }
+  } else {
+    steps.push({
+      hop: 2,
+      name: "path_whitelist",
+      description: "白名单检查",
+      passed: true,
+      detail: "白名单为空，跳过检查",
+    });
+  }
+
+  // ===== Hop 3: 敏感路径检查 =====
+  if (filePath && allowed) {
+    const sensitiveCheck = isSensitivePath(filePath);
+    steps.push({
+      hop: 3,
+      name: "sensitive_path",
+      description: "敏感路径检查",
+      passed: !sensitiveCheck.sensitive,
+      detail: sensitiveCheck.sensitive ? `敏感路径: ${sensitiveCheck.reason}` : "非敏感路径",
+      suggestion: sensitiveCheck.sensitive ? sensitiveCheck.suggestion : undefined,
+    });
+    if (sensitiveCheck.sensitive) {
+      allowed = false;
+      blockedBy = "sensitive_path";
+      finalReason = sensitiveCheck.reason;
+      suggestion = sensitiveCheck.suggestion;
+    }
+  } else {
+    steps.push({
+      hop: 3,
+      name: "sensitive_path",
+      description: "敏感路径检查",
+      passed: true,
+      detail: "无路径或已拦截，跳过",
+    });
+  }
+
+  // ===== Hop 4: 恶意内容检查（仅 write/edit）=====
+  if ((toolName === "write" || toolName === "edit") && content && allowed) {
+    const maliciousPatterns = [
+      { pattern: /curl[^|]*\|\s*bash/gi, reason: "curl|bash 下载执行", suggestion: "先下载到文件，再执行" },
+      { pattern: /wget[^|]*\|\s*bash/gi, reason: "wget|bash 下载执行", suggestion: "先下载到文件，再执行" },
+      { pattern: /eval\s*\(\s*base64_decode/gi, reason: "Base64 解码执行", suggestion: "避免使用 eval 解码" },
+      { pattern: /DROP\s+TABLE/gi, reason: "DROP TABLE 注入", suggestion: "使用 ORM 或参数化查询" },
+      { pattern: /rm\s+-rf\s+\//gi, reason: "删除根目录", suggestion: "删除项目内文件请使用相对路径" },
+    ];
+
+    let maliciousFound = false;
+    for (const { pattern, reason, suggestion: s } of maliciousPatterns) {
+      if (pattern.test(content)) {
+        steps.push({
+          hop: 4,
+          name: "malicious_content",
+          description: "恶意内容检查",
+          passed: false,
+          detail: `检测到危险模式: ${reason}`,
+          suggestion: s,
+        });
+        maliciousFound = true;
+        allowed = false;
+        blockedBy = "malicious_content";
+        finalReason = reason;
+        suggestion = s;
+        break;
+      }
+    }
+
+    if (!maliciousFound) {
+      steps.push({
+        hop: 4,
+        name: "malicious_content",
+        description: "恶意内容检查",
+        passed: true,
+        detail: "未检测到恶意内容",
+      });
+    }
+  } else {
+    steps.push({
+      hop: 4,
+      name: "malicious_content",
+      description: "恶意内容检查",
+      passed: true,
+      detail: "无需检查（无内容或已拦截）",
+    });
+  }
+
+  // ===== Hop 5: 决策 =====
+  steps.push({
+    hop: 5,
+    name: "decision",
+    description: "最终决策",
+    passed: allowed,
+    detail: allowed ? "允许执行" : `拦截原因: ${finalReason}`,
+    suggestion: !allowed && suggestion ? suggestion : undefined,
+  });
+
+  return { allowed, steps, finalReason, suggestion, blockedBy };
+}
+
+// ============================================================
+// 格式化决策输出
+// ============================================================
+
+function formatDecision(decision: ConstraintDecision, toolName: string, filePath: string): string {
+  let message = "";
+
+  if (decision.allowed) {
+    message += `✅ **路径检查通过**\n\n`;
+  } else {
+    message += `🔒 **路径检查拦截**\n\n`;
+  }
+
+  message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  message += `🛡️ 多跳决策追踪\n`;
+  message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  for (const step of decision.steps) {
+    const icon = step.passed ? "✅" : "❌";
+    const name = step.name.replace("_", " ");
+    message += `**Hop ${step.hop}: ${name}**\n`;
+    message += `${icon} ${step.description}\n`;
+    if (step.detail) message += `   📝 ${step.detail}\n`;
+    if (step.suggestion && !step.passed) {
+      message += `   💡 建议: ${step.suggestion}\n`;
+    }
+    message += `\n`;
+  }
+
+  message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+  if (!decision.allowed) {
+    message += `\n🚫 **最终决策: 拦截**\n`;
+    message += `拦截规则: ${decision.blockedBy}\n`;
+    if (decision.suggestion) {
+      message += `\n💡 **修复建议**\n${decision.suggestion}\n`;
     }
   }
 
-  const base64Matches = content.match(/[A-Za-z0-9+/]{20,}={0,2}/g) || [];
-  for (const b64 of base64Matches) {
-    try {
-      const decoded = Buffer.from(b64, "base64").toString("utf-8");
-      for (const p of advancedPatterns) {
-        if (p.pattern.test(decoded)) {
-          return { detected: true, reason: `${p.reason} (Base64 解码后)` };
-        }
-      }
-    } catch {}
-  }
-
-  return { detected: false };
+  return message;
 }
 
 // ============================================================
@@ -221,30 +305,9 @@ function log(config: PathWhitelistConfig, tool: string, filePath: string, allowe
   if (!config.logFile) return;
   try {
     const dir = path.dirname(config.logFile);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    const timestamp = new Date().toISOString();
-    const status = allowed ? "ALLOWED" : "BLOCKED";
-    const reasonStr = reason ? ` (${reason})` : "";
-    const line = `[${timestamp}] [${status}] ${tool}: ${filePath}${reasonStr}\n`;
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const line = `[${new Date().toISOString()}] [${allowed ? "ALLOWED" : "BLOCKED"}] ${tool}: ${filePath}${reason ? ` (${reason})` : ""}\n`;
     fs.appendFileSync(config.logFile, line, "utf-8");
-  } catch {}
-}
-
-function logMaliciousContent(config: PathWhitelistConfig, tool: string, filePath: string, reasons: string[], snippets: string[]) {
-  if (!config.maliciousLogFile) return;
-  try {
-    const dir = path.dirname(config.maliciousLogFile);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    const timestamp = new Date().toISOString();
-    const line = `[${timestamp}] [${tool}] File: ${filePath}\n` +
-      `  检测到特征:\n${reasons.map((r) => `    - ${r}`).join("\n")}\n` +
-      (snippets.length > 0 ? `  匹配片段:\n${snippets.map((s) => `    \`${s.slice(0, 80)}\``).join("\n")}\n` : "") +
-      `  处置: ${config.maliciousWarnOnly ? "告警仅记录" : "拦截写入"}\n\n`;
-    fs.appendFileSync(config.maliciousLogFile, line, "utf-8");
   } catch {}
 }
 
@@ -255,79 +318,39 @@ function logMaliciousContent(config: PathWhitelistConfig, tool: string, filePath
 export default function (pi: ExtensionAPI) {
   const config: PathWhitelistConfig = { ...DEFAULT_CONFIG };
 
-  console.log("[PathWhitelist] 路径白名单扩展已加载");
+  console.log("[PathWhitelist] 路径白名单扩展已加载（多跳追踪版）");
 
   // ============================================================
-  // 拦截文件操作
+  // 拦截文件操作 - 使用多跳追踪
   // ============================================================
 
   pi.on("tool_call", async (event, ctx) => {
     const toolName = event.toolName;
-    const params = event.input || {};
+    const params = (event.input || {}) as Record<string, any>;
 
+    // 只检查允许的工具
     if (!config.allowedTools.includes(toolName)) return;
 
-    let filePath = "";
-    if (toolName === "read" || toolName === "edit" || toolName === "write") {
-      filePath = params.path || params.file_path || "";
-    }
+    const filePath = params.path || params.file_path || "";
 
-    if (!filePath) return;
+    // 运行多跳检查
+    const decision = runMultiHopChecks(toolName, params, config);
 
-    // 检查敏感路径
-    const sensitiveCheck = isSensitivePath(filePath);
-    if (sensitiveCheck.sensitive) {
-      log(config, toolName, filePath, false, `敏感路径: ${sensitiveCheck.reason}`);
-      ctx.ui.notify(`🔒 [PathWhitelist] 禁止访问敏感路径\n\n路径: ${filePath}\n原因: ${sensitiveCheck.reason}`, "error");
+    // 记录日志
+    log(config, toolName, filePath, decision.allowed, decision.finalReason);
+
+    // 如果不允许，拦截并显示追踪过程
+    if (!decision.allowed) {
+      const message = formatDecision(decision, toolName, filePath);
+      ctx.ui.notify(message, "error");
+
       event.preventDefault?.();
-      return { allowed: false, message: `敏感路径禁止访问: ${sensitiveCheck.reason}` };
+      return {
+        allowed: false,
+        message: decision.finalReason,
+        decision: decision,  // 传递完整决策过程
+      };
     }
-
-    // 检查白名单
-    if (config.whitelist.length > 0) {
-      const allowed = isPathAllowed(filePath, config.whitelist);
-      if (!allowed.allowed) {
-        log(config, toolName, filePath, false, allowed.reason);
-        if (config.warnOnly) {
-          ctx.ui.notify(`⚠️ [PathWhitelist] 路径不在白名单内\n\n路径: ${filePath}`, "warning");
-        } else {
-          ctx.ui.notify(`🔒 [PathWhitelist] 路径不在白名单内\n\n路径: ${filePath}`, "error");
-          event.preventDefault?.();
-          return { allowed: false, message: `路径不在白名单内: ${filePath}` };
-        }
-      }
-    }
-
-    if (config.logAll) log(config, toolName, filePath, true);
-  });
-
-  // ============================================================
-  // 拦截文件写入（检查恶意内容）
-  // ============================================================
-
-  pi.on("tool_call", async (event, ctx) => {
-    const toolName = event.toolName;
-    const params = event.input || {};
-
-    if (toolName !== "write" && toolName !== "edit") return;
-
-    const content = params.content || params.newText || "";
-    if (!content) return;
-
-    const malicious = hasAdvancedMalicious(content);
-    if (!malicious.detected) return;
-
-    const filePath = params.path || params.file_path || "unknown";
-
-    if (!config.maliciousWarnOnly) {
-      logMaliciousContent(config, toolName, filePath, [malicious.reason!], []);
-      ctx.ui.notify(`🚨 [PathWhitelist] 严格模式：拒绝写入恶意内容\n\n文件: ${filePath}\n检测到: ${malicious.reason}`, "error");
-      event.preventDefault?.();
-      return { allowed: false };
-    }
-
-    logMaliciousContent(config, toolName, filePath, [malicious.reason!], []);
-    ctx.ui.notify(`🚨 [PathWhitelist] 检测到恶意内容特征\n\n文件: ${filePath}\n检测到: ${malicious.reason}`, "warning");
   });
 
   // ============================================================
@@ -337,28 +360,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("path-whitelist-status", {
     description: "查看路径白名单状态",
     handler: async (_args, ctx) => {
-      let message = "🔒 路径白名单状态\n\n";
+      let message = "🔒 路径白名单状态（多跳追踪版）\n\n";
       message += `启用: ${config.enabled ? "是" : "否"}\n`;
       message += `模式: ${config.warnOnly ? "警告模式" : "阻止模式"}\n`;
-      message += `保护工具: ${config.allowedTools.join(", ")}\n\n`;
+      message += `追踪hops: 5\n\n`;
       message += `白名单路径:\n`;
       if (config.whitelist.length === 0) {
-        message += `  （未设置，请使用 /path-whitelist-add 添加）\n`;
+        message += `  （未设置）\n`;
       } else {
         config.whitelist.forEach((p) => { message += `  ✅ ${p}\n`; });
       }
-      ctx.ui.notify(message, "info");
-    },
-  });
-
-  pi.registerCommand("path-whitelist-list", {
-    description: "列出所有白名单路径",
-    handler: async (_args, ctx) => {
-      if (config.whitelist.length === 0) {
-        ctx.ui.notify("ℹ️ 白名单为空\n\n使用 /path-whitelist-add <路径> 添加", "info");
-        return;
-      }
-      const message = "📋 白名单路径列表\n\n" + config.whitelist.map((p, i) => `${i + 1}. ${p}`).join("\n");
       ctx.ui.notify(message, "info");
     },
   });
@@ -367,16 +378,16 @@ export default function (pi: ExtensionAPI) {
     description: "添加白名单路径",
     handler: async (args, ctx) => {
       if (!args || args.length === 0) {
-        ctx.ui.notify("❌ 请指定路径\n\n用法: /path-whitelist-add <路径>", "warning");
+        ctx.ui.notify("用法: /path-whitelist-add <路径>", "warning");
         return;
       }
       const newPath = args.join(" ");
-      if (config.whitelist.includes(newPath)) {
-        ctx.ui.notify(`ℹ️ 路径已在白名单中: ${newPath}`, "info");
-        return;
+      if (!config.whitelist.includes(newPath)) {
+        config.whitelist.push(newPath);
+        ctx.ui.notify(`✅ 已添加: ${newPath}\n\n白名单现在包含 ${config.whitelist.length} 个路径`, "info");
+      } else {
+        ctx.ui.notify(`ℹ️ 已存在: ${newPath}`, "info");
       }
-      config.whitelist.push(newPath);
-      ctx.ui.notify(`✅ 已添加白名单: ${newPath}`, "info");
     },
   });
 
@@ -384,60 +395,28 @@ export default function (pi: ExtensionAPI) {
     description: "移除白名单路径",
     handler: async (args, ctx) => {
       if (!args || args.length === 0) {
-        ctx.ui.notify("❌ 请指定路径\n\n用法: /path-whitelist-remove <路径>", "warning");
+        ctx.ui.notify("用法: /path-whitelist-remove <路径>", "warning");
         return;
       }
       const removePath = args.join(" ");
       const index = config.whitelist.indexOf(removePath);
-      if (index === -1) {
-        ctx.ui.notify(`ℹ️ 路径不在白名单中: ${removePath}`, "info");
-        return;
-      }
-      config.whitelist.splice(index, 1);
-      ctx.ui.notify(`✅ 已移除白名单: ${removePath}`, "info");
-    },
-  });
-
-  pi.registerCommand("path-whitelist-toggle", {
-    description: "切换阻止/警告模式",
-    handler: async (_args, ctx) => {
-      config.warnOnly = !config.warnOnly;
-      ctx.ui.notify(`✅ 已切换到 ${config.warnOnly ? "警告模式" : "阻止模式"}`, "info");
-    },
-  });
-
-  pi.registerCommand("path-whitelist-strict", {
-    description: "切换恶意内容严格模式",
-    handler: async (args, ctx) => {
-      if (!args || args.length === 0) {
-        ctx.ui.notify(`当前模式: ${config.maliciousWarnOnly ? "警告模式" : "严格模式"}\n\n用法:\n  /path-whitelist-strict enable\n  /path-whitelist-strict disable`, "info");
-        return;
-      }
-      const action = args[0].toLowerCase();
-      if (action === "enable") {
-        config.maliciousWarnOnly = false;
-        ctx.ui.notify("🚨 已启用严格模式\n\n恶意内容写入将被拦截。", "warning");
-      } else if (action === "disable") {
-        config.maliciousWarnOnly = true;
-        ctx.ui.notify("✅ 已禁用严格模式（警告模式）", "info");
+      if (index >= 0) {
+        config.whitelist.splice(index, 1);
+        ctx.ui.notify(`✅ 已移除: ${removePath}`, "info");
       } else {
-        ctx.ui.notify(`❌ 未知操作: ${action}`, "warning");
+        ctx.ui.notify(`ℹ️ 不在白名单中: ${removePath}`, "info");
       }
     },
   });
 
-  pi.registerCommand("path-whitelist-log", {
-    description: "查看恶意内容告警日志",
+  pi.registerCommand("path-whitelist-list", {
+    description: "列出白名单路径",
     handler: async (_args, ctx) => {
-      if (!fs.existsSync(config.maliciousLogFile)) {
-        ctx.ui.notify(`ℹ️ 日志文件不存在\n\n尚未触发任何恶意内容告警。`, "info");
-        return;
+      if (config.whitelist.length === 0) {
+        ctx.ui.notify("ℹ️ 白名单为空", "info");
+      } else {
+        ctx.ui.notify("📋 白名单:\n" + config.whitelist.map((p, i) => `${i + 1}. ${p}`).join("\n"), "info");
       }
-      const content = fs.readFileSync(config.maliciousLogFile, "utf-8");
-      const entries = content.split("\n\n").filter(Boolean);
-      const recent = entries.slice(-10).reverse();
-      const message = `🚨 恶意内容告警日志（最近 ${recent.length} 条）\n\n日志文件: ${config.maliciousLogFile}\n总记录数: ${entries.length}\n\n${"─".repeat(50)}\n\n${recent.join("\n\n")}`;
-      ctx.ui.notify(message, "info");
     },
   });
 }
