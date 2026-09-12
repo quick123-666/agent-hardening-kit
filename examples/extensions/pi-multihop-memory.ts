@@ -1,7 +1,7 @@
 /**
  * Pi Multi-Hop + Memory Integration Extension
  *
- * 自动将多跳推理结果保存到长期记忆，让未来的会话可以复用
+ * 自动将多跳推理结果保存到长期记忆
  *
  * 功能：
  * 1. 自动保存推理链到长期记忆
@@ -24,18 +24,11 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 // ============================================================
-// 共享状态（与 pi-multihop-reasoning.ts 配合）
+// 状态文件
 // ============================================================
 
-const REASONING_STATE_FILE = path.join(
-  os.homedir(),
-  ".pi",
-  "agent",
-  "state",
-  "multihop-state.json"
-);
+const REASONING_STATE_FILE = path.join(os.homedir(), ".pi", "agent", "state", "multihop-state.json");
 
-// 读取其他扩展的状态
 function loadReasoningState(): any {
   try {
     if (fs.existsSync(REASONING_STATE_FILE)) {
@@ -91,14 +84,12 @@ function loadAllReasonings(): ReasoningRecord[] {
   ensureMemoryDir();
   const files = fs.readdirSync(MEMORY_DIR).filter((f) => f.endsWith(".json"));
   const records: ReasoningRecord[] = [];
-
   for (const f of files) {
     try {
       const content = fs.readFileSync(path.join(MEMORY_DIR, f), "utf-8");
       records.push(JSON.parse(content));
     } catch {}
   }
-
   return records.sort((a, b) => b.timestamp - a.timestamp);
 }
 
@@ -106,29 +97,20 @@ function searchReasonings(query: string, limit = 5): ReasoningRecord[] {
   const records = loadAllReasonings();
   const lowerQuery = query.toLowerCase();
 
-  // 简单的关键词匹配（可以替换为向量搜索）
   const scored = records.map((r) => {
     let score = 0;
     const text = `${r.query} ${r.conclusion} ${r.tags.join(" ")}`.toLowerCase();
     const words = lowerQuery.split(/\s+/).filter((w) => w.length > 0);
-
     for (const word of words) {
       if (text.includes(word)) score += 1;
     }
-
-    // 标签完全匹配加分
     for (const tag of r.tags) {
       if (lowerQuery.includes(tag.toLowerCase())) score += 2;
     }
-
     return { record: r, score };
   });
 
-  return scored
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map((s) => s.record);
+  return scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map((s) => s.record);
 }
 
 // ============================================================
@@ -137,36 +119,26 @@ function searchReasonings(query: string, limit = 5): ReasoningRecord[] {
 
 export default function (pi: ExtensionAPI) {
   console.log("[MultiHop+Memory] 多跳推理 + 长期记忆扩展已加载");
-  console.log(`[MultiHop+Memory] 记忆目录: ${MEMORY_DIR}`);
+
+  const toolCallCounts = new Map<string, number>();
 
   // ============================================================
   // 保存推理到记忆
   // ============================================================
 
-  pi.registerCommand({
-    name: "reasoning-save",
+  pi.registerCommand("reasoning-save", {
     description: "保存当前推理链到长期记忆",
-    async execute(ctx) {
-      const args = ctx.args || [];
-      const tags = args.length > 0 ? args : ["reasoning"];
-
-      // 加载共享状态
+    handler: async (args, ctx) => {
+      const tags = args && args.length > 0 ? args : ["reasoning"];
       const state = loadReasoningState();
       const sessionId = ctx.sessionId || "default";
       const chain = state.chains[sessionId];
 
       if (!chain || !chain.steps || chain.steps.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ 当前会话没有推理记录可保存\n\n请先进行一些工具调用再保存",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ 当前会话没有推理记录可保存\n\n请先进行一些工具调用再保存", "info");
+        return;
       }
 
-      // 构造记录
       const record: ReasoningRecord = {
         id: generateId(),
         timestamp: Date.now(),
@@ -180,19 +152,7 @@ export default function (pi: ExtensionAPI) {
       };
 
       const file = saveReasoning(record);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ 推理已保存到长期记忆\n\n` +
-              `ID: ${record.id}\n` +
-              `标签: ${tags.join(", ")}\n` +
-              `跳数: ${chain.steps.length}\n` +
-              `文件: ${file}`,
-          },
-        ],
-      };
+      ctx.ui.notify(`✅ 推理已保存到长期记忆\n\nID: ${record.id}\n标签: ${tags.join(", ")}\n跳数: ${chain.steps.length}`, "info");
     },
   });
 
@@ -200,38 +160,23 @@ export default function (pi: ExtensionAPI) {
   // 从记忆检索推理
   // ============================================================
 
-  pi.registerCommand({
-    name: "reasoning-recall",
+  pi.registerCommand("reasoning-recall", {
     description: "从长期记忆中检索相关推理",
-    async execute(ctx) {
-      const args = ctx.args || [];
-      if (args.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "❌ 请提供查询关键词\n\n用法: /reasoning-recall <关键词>",
-            },
-          ],
-        };
+    handler: async (args, ctx) => {
+      if (!args || args.length === 0) {
+        ctx.ui.notify("❌ 请提供查询关键词\n\n用法: /reasoning-recall <关键词>", "warning");
+        return;
       }
 
       const query = args.join(" ");
       const results = searchReasonings(query);
 
       if (results.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `ℹ️ 没有找到关于 "${query}" 的推理记录`,
-            },
-          ],
-        };
+        ctx.ui.notify(`ℹ️ 没有找到关于 "${query}" 的推理记录`, "info");
+        return;
       }
 
       let message = `🔍 找到 ${results.length} 条相关推理\n\n`;
-
       for (const r of results) {
         const date = new Date(r.timestamp).toLocaleString();
         message += `━━━ ${r.id} ━━━\n`;
@@ -242,7 +187,7 @@ export default function (pi: ExtensionAPI) {
         message += `结论: ${r.conclusion.substring(0, 100)}${r.conclusion.length > 100 ? "..." : ""}\n\n`;
       }
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
@@ -250,56 +195,39 @@ export default function (pi: ExtensionAPI) {
   // 列出最近推理
   // ============================================================
 
-  pi.registerCommand({
-    name: "reasoning-list",
+  pi.registerCommand("reasoning-list", {
     description: "列出最近的推理记录",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const records = loadAllReasonings().slice(0, 10);
 
       if (records.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ 还没有保存任何推理记录",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ 还没有保存任何推理记录", "info");
+        return;
       }
 
       let message = `📚 最近的 ${records.length} 条推理\n\n`;
-
       for (const r of records) {
         const date = new Date(r.timestamp).toLocaleString();
         message += `• [${date}] ${r.query.substring(0, 60)}\n`;
         message += `  ID: ${r.id} | 标签: ${r.tags.join(", ")} | 跳数: ${r.steps.length}\n\n`;
       }
-
       message += `\n使用 /reasoning-recall <关键词> 检索特定推理`;
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
   // ============================================================
-  // 自动保存重要推理
+  // 自动保存提示
   // ============================================================
-
-  // 监听工具调用，当调用数达到阈值时自动提示保存
-  const toolCallCounts = new Map<string, number>();
 
   pi.on("tool_call", async (event, ctx) => {
     const sessionId = ctx.sessionId || "default";
     const count = (toolCallCounts.get(sessionId) || 0) + 1;
     toolCallCounts.set(sessionId, count);
 
-    // 每 10 次工具调用提醒一次
     if (count % 10 === 0) {
-      ctx.ui.notify(
-        `📝 [MultiHop+Memory] 已完成 ${count} 跳推理\n\n` +
-          `使用 /reasoning-save [标签] 保存到长期记忆`,
-        "info"
-      );
+      ctx.ui.notify(`📝 [MultiHop+Memory] 已完成 ${count} 跳推理\n\n使用 /reasoning-save [标签] 保存到长期记忆`, "info");
     }
   });
 

@@ -6,7 +6,7 @@
  * 2. 记录每一步的工具调用和结果
  * 3. 可视化推理链
  * 4. 支持中断/恢复
- * 5. 检测死循环（同一工具重复调用）
+ * 5. 检测死循环
  * 6. 提供 /trace 命令查看推理历史
  *
  * 使用方法：
@@ -30,15 +30,10 @@ import * as os from "node:os";
 
 interface MultiHopConfig {
   enabled: boolean;
-  /** 最大跳数（防止无限循环） */
   maxHops: number;
-  /** 警告跳数（提醒用户） */
   warnHops: number;
-  /** 检测重复调用的窗口 */
   repeatWindow: number;
-  /** 日志文件 */
   logFile: string;
-  /** 是否记录所有步骤 */
   verbose: boolean;
 }
 
@@ -78,40 +73,29 @@ interface ReasoningChain {
 
 const chains = new Map<string, ReasoningChain>();
 const toolCallCounts = new Map<string, number>();
+let config: MultiHopConfig;
 
 // ============================================================
 // 核心逻辑
 // ============================================================
 
 function startChain(sessionId: string): ReasoningChain {
-  const chain: ReasoningChain = {
-    sessionId,
-    startTime: Date.now(),
-    steps: [],
-  };
+  const chain: ReasoningChain = { sessionId, startTime: Date.now(), steps: [] };
   chains.set(sessionId, chain);
   return chain;
 }
 
-function addStep(sessionId: string, step: ReasoningStep) {
+function addStep(sessionId: string, step: ReasoningStep, ctx: any) {
   let chain = chains.get(sessionId);
-  if (!chain) {
-    chain = startChain(sessionId);
-  }
+  if (!chain) chain = startChain(sessionId);
   chain.steps.push(step);
 
-  // 检测死循环
   if (chain.steps.length >= config.repeatWindow) {
     const recent = chain.steps.slice(-config.repeatWindow);
     const signatures = recent.map((s) => `${s.toolName}:${JSON.stringify(s.args)}`);
     const allSame = signatures.every((s) => s === signatures[0]);
     if (allSame) {
-      ctx?.ui?.notify(
-        `🔄 [MultiHop] 检测到可能的死循环\n\n` +
-          `连续 ${config.repeatWindow} 次调用相同工具\n` +
-          `建议：明确告诉 AI 你想要的结果`,
-        "warning"
-      );
+      ctx.ui?.notify(`🔄 [MultiHop] 检测到可能的死循环\n\n连续 ${config.repeatWindow} 次调用相同工具\n建议：明确告诉 AI 你想要的结果`, "warning");
     }
   }
 }
@@ -122,10 +106,8 @@ function getChain(sessionId: string): ReasoningChain | undefined {
 
 function clearChain(sessionId: string) {
   chains.delete(sessionId);
+  toolCallCounts.delete(sessionId);
 }
-
-let config: MultiHopConfig;
-let ctx: any;
 
 // ============================================================
 // 扩展主逻辑
@@ -133,12 +115,9 @@ let ctx: any;
 
 export default function (pi: ExtensionAPI) {
   config = { ...DEFAULT_CONFIG };
-  ctx = pi; // 简化：实际应使用闭包传入
 
   console.log("[MultiHop] 多跳推理追踪扩展已加载");
-  console.log(`[MultiHop] 最大跳数: ${config.maxHops}`);
-  console.log(`[MultiHop] 警告跳数: ${config.warnHops}`);
-  console.log(`[MultiHop] 日志文件: ${config.logFile}`);
+  console.log(`[MultiHop] 最大跳数: ${config.maxHops}, 警告跳数: ${config.warnHops}`);
 
   // ============================================================
   // 监听 LLM 调用
@@ -163,30 +142,17 @@ export default function (pi: ExtensionAPI) {
       args: event.input,
     };
 
-    addStep(sessionId, step);
+    addStep(sessionId, step, ctx);
 
-    // 计数
-    const count = toolCallCounts.get(sessionId) || 0;
-    toolCallCounts.set(sessionId, count + 1);
+    const count = (toolCallCounts.get(sessionId) || 0) + 1;
+    toolCallCounts.set(sessionId, count);
 
-    // 警告
     if (step.hop === config.warnHops) {
-      ctx.ui.notify(
-        `⚠️ [MultiHop] 已完成 ${config.warnHops} 跳推理\n\n` +
-          `LLM 已调用 ${count + 1} 次工具\n` +
-          `如不需要继续，可直接告诉 AI 停止`,
-        "warning"
-      );
+      ctx.ui.notify(`⚠️ [MultiHop] 已完成 ${config.warnHops} 跳推理\n\nLLM 已调用 ${count} 次工具\n如不需要继续，可直接告诉 AI 停止`, "warning");
     }
 
-    // 强制中断
     if (step.hop > config.maxHops) {
-      ctx.ui.notify(
-        `🚫 [MultiHop] 超过最大跳数 (${config.maxHops})\n\n` +
-          `为防止无限循环，已中断本次推理\n` +
-          `请明确告诉 AI 你想要的结果`,
-        "error"
-      );
+      ctx.ui.notify(`🚫 [MultiHop] 超过最大跳数 (${config.maxHops})\n\n为防止无限循环，已中断本次推理\n请明确告诉 AI 你想要的结果`, "error");
       event.preventDefault?.();
       return { allowed: false };
     }
@@ -206,16 +172,11 @@ export default function (pi: ExtensionAPI) {
       lastStep.result = event.result;
       lastStep.duration = Date.now() - lastStep.timestamp;
 
-      // 记录到日志
       try {
         fs.mkdirSync(path.dirname(config.logFile), { recursive: true });
         const logEntry = JSON.stringify({
-          sessionId,
-          hop: lastStep.hop,
-          tool: lastStep.toolName,
-          args: lastStep.args,
-          duration: lastStep.duration,
-          timestamp: lastStep.timestamp,
+          sessionId, hop: lastStep.hop, tool: lastStep.toolName,
+          args: lastStep.args, duration: lastStep.duration, timestamp: lastStep.timestamp,
         }) + "\n";
         fs.appendFileSync(config.logFile, logEntry, "utf-8");
       } catch {}
@@ -226,31 +187,23 @@ export default function (pi: ExtensionAPI) {
   // 命令
   // ============================================================
 
-  // 查看推理链
-  pi.registerCommand({
-    name: "trace",
+  pi.registerCommand("trace", {
     description: "显示当前的多跳推理链",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const sessionId = ctx.sessionId || "default";
       const chain = chains.get(sessionId);
 
       if (!chain || chain.steps.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ 当前会话没有推理记录",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ 当前会话没有推理记录", "info");
+        return;
       }
 
       let message = `🔗 多跳推理链\n\n`;
       message += `会话 ID: ${chain.sessionId}\n`;
       message += `开始时间: ${new Date(chain.startTime).toLocaleString()}\n`;
       message += `总跳数: ${chain.steps.length}\n`;
-      message += `最大耗时: ${Math.max(...chain.steps.map((s) => s.duration || 0))}ms\n`;
-      message += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+      message += `最大耗时: ${Math.max(...chain.steps.map((s) => s.duration || 0))}ms\n\n`;
+      message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
       for (const step of chain.steps) {
         const duration = step.duration ? `${step.duration}ms` : "进行中";
@@ -261,30 +214,21 @@ export default function (pi: ExtensionAPI) {
         message += `  结果: ${step.result ? "✓" : step.error ? "✗" : "⏳"}\n\n`;
       }
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
-  // 推理统计
-  pi.registerCommand({
-    name: "trace-stats",
+  pi.registerCommand("trace-stats", {
     description: "查看推理统计信息",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const sessionId = ctx.sessionId || "default";
       const chain = chains.get(sessionId);
 
       if (!chain) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ 当前会话没有推理记录",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ 当前会话没有推理记录", "info");
+        return;
       }
 
-      // 统计
       const toolUsage = new Map<string, number>();
       let totalDuration = 0;
       let successCount = 0;
@@ -309,81 +253,38 @@ export default function (pi: ExtensionAPI) {
         message += `  ${tool}: ${count} 次\n`;
       }
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
-  // 清除推理历史
-  pi.registerCommand({
-    name: "trace-clear",
+  pi.registerCommand("trace-clear", {
     description: "清除当前会话的推理历史",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const sessionId = ctx.sessionId || "default";
       clearChain(sessionId);
-      toolCallCounts.delete(sessionId);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ 已清除会话 ${sessionId} 的推理历史`,
-          },
-        ],
-      };
+      ctx.ui.notify(`✅ 已清除会话 ${sessionId} 的推理历史`, "info");
     },
   });
 
-  // 导出推理日志
-  pi.registerCommand({
-    name: "trace-export",
+  pi.registerCommand("trace-export", {
     description: "导出推理日志到 JSON 文件",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const sessionId = ctx.sessionId || "default";
       const chain = chains.get(sessionId);
 
       if (!chain) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ 没有可导出的推理记录",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ 没有可导出的推理记录", "info");
+        return;
       }
 
-      const exportFile = path.join(
-        os.homedir(),
-        ".pi",
-        "agent",
-        "logs",
-        `trace-${sessionId}-${Date.now()}.json`
-      );
+      const exportFile = path.join(os.homedir(), ".pi", "agent", "logs", `trace-${sessionId}-${Date.now()}.json`);
 
       try {
         fs.mkdirSync(path.dirname(exportFile), { recursive: true });
-        fs.writeFileSync(
-          exportFile,
-          JSON.stringify(chain, null, 2),
-          "utf-8"
-        );
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `✅ 推理日志已导出到: ${exportFile}\n\n总跳数: ${chain.steps.length}`,
-            },
-          ],
-        };
+        fs.writeFileSync(exportFile, JSON.stringify(chain, null, 2), "utf-8");
+        ctx.ui.notify(`✅ 推理日志已导出到: ${exportFile}\n\n总跳数: ${chain.steps.length}`, "info");
       } catch (err) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `❌ 导出失败: ${err}`,
-            },
-          ],
-        };
+        ctx.ui.notify(`❌ 导出失败: ${err}`, "error");
       }
     },
   });

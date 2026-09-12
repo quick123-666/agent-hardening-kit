@@ -15,7 +15,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import * as os from "node:os";
+import { appendFileSync } from "node:fs";
 
 // ============================================================
 // 配置
@@ -50,7 +50,6 @@ function log(config: DisableBashConfig, action: string, detail: string) {
   if (!config.logFile) return;
   try {
     const line = `[${new Date().toISOString()}] ${action}: ${detail}\n`;
-    const { appendFileSync } = require("node:fs");
     appendFileSync(config.logFile, line, "utf-8");
   } catch {
     // 忽略日志错误
@@ -152,10 +151,9 @@ export default function (pi: ExtensionAPI) {
   // ============================================================
 
   // 查看状态
-  pi.registerCommand({
-    name: "bash-status",
+  pi.registerCommand("bash-status", {
     description: "查看 bash 工具状态",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const active = pi.getActiveTools();
       const hasBash = active.includes("bash");
 
@@ -169,94 +167,54 @@ export default function (pi: ExtensionAPI) {
       message += active.map((t) => `  - ${t}`).join("\n");
       message += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
   // 临时启用 bash
-  pi.registerCommand({
-    name: "allow-bash",
+  pi.registerCommand("allow-bash", {
     description: "临时启用 bash 工具（当前会话有效）",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       if (!config.disabled) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ bash 工具已经是启用状态",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ bash 工具已经是启用状态", "info");
+        return;
       }
 
       const success = enableBash(pi, config);
       if (success) {
         console.log("[DisableBash] 💡 用户手动启用了 bash");
-        return {
-          content: [
-            {
-              type: "text",
-              text: "✅ bash 工具已临时启用\n\n⚠️ 注意：关闭当前会话后自动恢复禁用状态\n\n保留工具:\n" + pi.getActiveTools().map((t) => `  - ${t}`).join("\n"),
-            },
-          ],
-        };
+        ctx.ui.notify(
+          "✅ bash 工具已临时启用\n\n⚠️ 注意：关闭当前会话后自动恢复禁用状态\n\n保留工具:\n" + pi.getActiveTools().map((t) => `  - ${t}`).join("\n"),
+          "info"
+        );
       } else {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "❌ 启用 bash 失败",
-            },
-          ],
-        };
+        ctx.ui.notify("❌ 启用 bash 失败", "error");
       }
     },
   });
 
   // 禁用 bash
-  pi.registerCommand({
-    name: "disable-bash",
+  pi.registerCommand("disable-bash", {
     description: "禁用 bash 工具",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       if (config.disabled) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ bash 工具已经是禁用状态",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ bash 工具已经是禁用状态", "info");
+        return;
       }
 
       const success = disableBash(pi, config);
       if (success) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "✅ bash 工具已禁用\n\n💡 使用 /allow-bash 可临时启用",
-            },
-          ],
-        };
+        ctx.ui.notify("✅ bash 工具已禁用\n\n💡 使用 /allow-bash 可临时启用", "info");
       } else {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "❌ 禁用 bash 失败",
-            },
-          ],
-        };
+        ctx.ui.notify("❌ 禁用 bash 失败", "error");
       }
     },
   });
 
   // 列出当前工具
-  pi.registerCommand({
-    name: "list-tools",
+  pi.registerCommand("list-tools", {
     description: "列出所有可用工具",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const all = pi.getAllTools();
       const active = pi.getActiveTools();
 
@@ -279,7 +237,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
@@ -289,18 +247,14 @@ export default function (pi: ExtensionAPI) {
 
   // 虽然 bash 工具已被移除，但保留此拦截器作为额外保护层
   pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName === "bash") {
-      // 如果 bash 被调用但状态是禁用的，说明有问题
-      if (config.disabled) {
-        ctx.ui.notify(
-          "🔒 bash 工具已禁用\n\n" +
-            "如需启用，请使用命令：\n" +
-            "  /allow-bash",
-          "warning"
-        );
-        event.preventDefault?.();
-        return { allowed: false };
-      }
+    if (event.toolName === "bash" && config.disabled) {
+      ctx.ui.notify(
+        "🔒 bash 工具已禁用\n\n" +
+          "如需启用，请使用命令：\n" +
+          "  /allow-bash",
+        "warning"
+      );
+      return { block: true, reason: "bash 工具已被禁用，请使用 /allow-bash 临时启用" };
     }
   });
 

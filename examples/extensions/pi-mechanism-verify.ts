@@ -293,33 +293,30 @@ export default function (pi: ExtensionAPI) {
   console.log("[MechanismVerify] 命令: /spike, /verify, /mechanism-status");
 
   // ============================================================
-  // 在用户消息中检测风险
+  // 在用户输入中检测风险（input 事件）
   // ============================================================
-  pi.on("user_message", async (event, ctx) => {
-    const content = typeof event.message === "string"
-      ? event.message
-      : event.message?.content || "";
+  pi.on("input", async (event, ctx) => {
+    const text = event.text || "";
+    if (!text) return;
 
-    if (!content) return;
+    const risks = detectRisks(text);
+    if (risks.length === 0) return;
 
-    const risks = detectRisks(content);
-    if (risks.length > 0) {
-      const unverified = risks.filter(r => !store.isVerified(r.id));
-      if (unverified.length > 0) {
-        // 打印提醒到 UI（不阻塞）
-        const msg = `⚠️ [MechanismVerify] 检测到 ${unverified.length} 个未验证机制风险\n` +
-                    unverified.map(r => `  • ${r.category}`).join("\n") +
-                    `\n建议先 /spike 验证，或 /verify 标记已验证`;
-        console.log(msg);
-      }
-    }
+    const unverified = risks.filter(r => !store.isVerified(r.id));
+    if (unverified.length === 0) return;
+
+    // 打印提醒到控制台（不阻塞，不阻塞交互）
+    const msg = `⚠️ [MechanismVerify] 检测到 ${unverified.length} 个未验证机制风险\n` +
+                unverified.map(r => `  • ${r.category}`).join("\n") +
+                `\n建议先 /spike 验证，或 /verify 标记已验证`;
+    console.log(msg);
   });
 
   // ============================================================
-  // 在 LLM 处理前注入提醒
+  // 在 LLM 处理前注入提醒（before_agent_start 事件）
   // ============================================================
-  pi.on("before_agent", async (event, ctx) => {
-    const prompt = event.prompt || "";
+  pi.on("before_agent_start", async (event, ctx) => {
+    const prompt = event.systemPromptOptions?.customPrompt || "";
     const risks = detectRisks(prompt);
     if (risks.length === 0) return;
 
@@ -330,7 +327,11 @@ export default function (pi: ExtensionAPI) {
       `【${r.category}】\n   原因: ${r.reason}\n   Spike: ${r.spikeHint}`
     ).join("\n\n");
 
-    event.prompt += `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ 元约束：先验证机制（Spike-First）\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n${reminders}\n\n使用 /spike 生成验证脚本，或 /verify 标记已验证。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    if (event.systemPromptOptions) {
+      event.systemPromptOptions.customPrompt =
+        (event.systemPromptOptions.customPrompt || "") +
+        `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ 元约束：先验证机制（Spike-First）\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n${reminders}\n\n使用 /spike 生成验证脚本，或 /verify 标记已验证。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    }
   });
 
   // ============================================================
@@ -481,11 +482,12 @@ ${target.spikeTemplate}
   // ============================================================
   pi.registerTool({
     name: "mechanism_check",
+    label: "Mechanism Check",
     description: "检查文本中是否包含潜在风险操作（向量数据库、并发、文件锁、嵌入式 DB 等）",
     parameters: Type.Object({
       text: Type.String({ description: "要检查的文本" }),
     }),
-    handler: async (args: { text: string }) => {
+    execute: async (_toolCallId, args: { text: string }) => {
       const risks = detectRisks(args.text);
       const result = risks.map(r => ({
         id: r.id,
@@ -496,8 +498,13 @@ ${target.spikeTemplate}
       }));
 
       return {
-        message: `检测到 ${risks.length} 个潜在风险`,
-        risks: result,
+        content: [
+          {
+            type: "text",
+            text: `检测到 ${risks.length} 个潜在风险`,
+          },
+        ],
+        details: { risks: result },
       };
     },
   });
@@ -507,14 +514,20 @@ ${target.spikeTemplate}
   // ============================================================
   pi.registerTool({
     name: "spike_generate",
+    label: "Spike Generate",
     description: "生成机制验证 spike 脚本模板",
     parameters: Type.Object({
       topic: Type.String({ description: "风险类型 ID（如 milvus-lite, concurrent-threads）" }),
     }),
-    handler: async (args: { topic: string }) => {
+    execute: async (_toolCallId, args: { topic: string }) => {
       const risk = RISK_PATTERNS.find(r => r.id === args.topic);
       if (!risk) {
-        return { error: `未知 topic: ${args.topic}`, available: RISK_PATTERNS.map(r => r.id) };
+        return {
+          content: [
+            { type: "text", text: `未知 topic: ${args.topic}。可用: ${RISK_PATTERNS.map(r => r.id).join(", ")}` },
+          ],
+          details: { error: `未知 topic: ${args.topic}`, available: RISK_PATTERNS.map(r => r.id) },
+        };
       }
 
       const spikePath = path.join(process.cwd(), `spike_${risk.id}.py`);
@@ -528,12 +541,17 @@ ${risk.spikeTemplate}
       try {
         fs.writeFileSync(spikePath, content, "utf-8");
         return {
-          message: `Spike 脚本已生成: ${spikePath}`,
-          path: spikePath,
-          risk: { id: risk.id, category: risk.category, reason: risk.reason },
+          content: [{ type: "text", text: `Spike 脚本已生成: ${spikePath}` }],
+          details: {
+            path: spikePath,
+            risk: { id: risk.id, category: risk.category, reason: risk.reason },
+          },
         };
       } catch (err) {
-        return { error: `生成失败: ${err}` };
+        return {
+          content: [{ type: "text", text: `生成失败: ${err}` }],
+          details: { error: `生成失败: ${err}` },
+        };
       }
     },
   });

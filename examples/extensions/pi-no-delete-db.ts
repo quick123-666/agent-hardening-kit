@@ -349,101 +349,85 @@ export default function (pi: ExtensionAPI) {
   console.log(`[NoDeleteDB] 日志文件: ${config.logFile}`);
 
   // ============================================================
-  // 拦截 Bash 命令
+  // 拦截 Bash 命令（通过 tool_call hook，event.toolName === "bash"）
   // ============================================================
-  pi.on("bash_execute", async (event, ctx) => {
-    const command = event.command || "";
-    const result = checkCommand(command, config);
+  pi.on("tool_call", async (event, ctx) => {
+    // 1) bash 工具的危险命令拦截
+    if (event.toolName === "bash") {
+      const command = (event.input && (event.input.command as string)) || "";
+      if (!command) return;
 
-    if (result.matched && result.blocked) {
-      logAction(config, "BASH", command, true);
+      const result = checkCommand(command, config);
 
-      // 取消执行
-      event.preventDefault?.();
+      if (result.matched && result.blocked) {
+        logAction(config, "BASH", command, true);
 
-      let message = "";
-      if (result.pattern) {
-        message = `\n[BLOCKED] ${result.reason}\n\n`;
-        message += `命令: ${command}\n\n`;
-        message += `此操作已被阻止，原因：\n`;
-        message += `  - 操作类型: ${result.pattern.name}\n`;
-        message += `  - 危险等级: ${result.pattern.severity}\n`;
-        message += `  - 说明: ${result.pattern.description}\n\n`;
-        message += `如需临时允许此操作，使用：\n`;
-        message += `  /no-delete-db allow ${result.pattern.name}\n`;
-      } else {
-        message = `\n[BLOCKED] ${result.reason}\n`;
+        let message = "";
+        if (result.pattern) {
+          message = `\n[BLOCKED] ${result.reason}\n\n`;
+          message += `命令: ${command}\n\n`;
+          message += `此操作已被阻止，原因：\n`;
+          message += `  - 操作类型: ${result.pattern.name}\n`;
+          message += `  - 危险等级: ${result.pattern.severity}\n`;
+          message += `  - 说明: ${result.pattern.description}\n\n`;
+          message += `如需临时允许此操作，使用：\n`;
+          message += `  /no-delete-db allow ${result.pattern.name}\n`;
+        } else {
+          message = `\n[BLOCKED] ${result.reason}\n`;
+        }
+
+        ctx.ui.notify(message, "error");
+        console.log(`[NoDeleteDB] BLOCKED: ${command}`);
+        return { block: true, reason: result.reason || "数据库保护拦截" };
       }
 
-      ctx.ui.notify(message, "error");
-      console.log(`[NoDeleteDB] BLOCKED: ${command}`);
-      return { allowed: false, message: result.reason };
+      if (result.matched) {
+        logAction(config, "BASH", command, false);
+      }
+      return;
     }
 
-    if (result.matched) {
-      logAction(config, "BASH", command, false);
-    }
+    // 2) 文件写入：保护 .db 文件
+    if (event.toolName === "write" || event.toolName === "edit") {
+      const filePath = (event.input && (event.input.path as string)) || "";
 
-    return { allowed: true };
+      // 检查是否写入数据库文件
+      if (filePath && /\.(db|sqlite|sqlite3|sqlitedb)$/i.test(filePath)) {
+        if (fs.existsSync(filePath)) {
+          logAction(config, "FILE_OVERWRITE", filePath, true);
+          ctx.ui.notify(
+            `\n[BLOCKED] 禁止覆盖数据库文件: ${filePath}\n\n` +
+              `数据库文件应通过专用工具管理（如 pymilvus、psql 等）`,
+            "error"
+          );
+          return { block: true, reason: "禁止覆盖数据库文件" };
+        }
+      }
+
+      // 检查受保护路径中的删除/破坏性内容
+      if (filePath) {
+        for (const protectedPath of config.protectedPaths) {
+          if (filePath.includes(protectedPath)) {
+            // 仅在内容明显包含删除关键字时报警告
+            const content = (event.input && (event.input.content as string)) || "";
+            if (/(delete|drop|truncate|erase|wipe)/i.test(content)) {
+              logAction(config, "FILE_WRITE_PROTECTED", filePath, true);
+              ctx.ui.notify(
+                `\n[BLOCKED] 禁止向受保护路径写入危险内容: ${filePath}`,
+                "error"
+              );
+              return { block: true, reason: "受保护路径写入拦截" };
+            }
+          }
+        }
+      }
+    }
   });
 
   // ============================================================
-  // 拦截文件写入（保护 .db 文件）
+  // 文件删除拦截（通过 bash rm 命令，已经在 bash 分支覆盖；
+  // 这里保留一个安全网：监控 bash 命令中包含 db 文件名的 rm 操作）
   // ============================================================
-  pi.on("file_write", async (event, ctx) => {
-    const filePath = event.path || "";
-
-    // 检查是否写入数据库文件
-    if (/\.(db|sqlite|sqlite3|sqlitedb)$/i.test(filePath)) {
-      // 检查是否是覆盖
-      if (fs.existsSync(filePath)) {
-        logAction(config, "FILE_OVERWRITE", filePath, true);
-        ctx.ui.notify(
-          `\n[BLOCKED] 禁止覆盖数据库文件: ${filePath}\n\n` +
-          `数据库文件应通过专用工具管理（如 pymilvus、psql 等）`,
-          "error"
-        );
-        event.preventDefault?.();
-        return { allowed: false };
-      }
-    }
-
-    return { allowed: true };
-  });
-
-  // ============================================================
-  // 拦截文件删除
-  // ============================================================
-  pi.on("file_delete", async (event, ctx) => {
-    const filePath = event.path || "";
-
-    // 检查是否是数据库文件
-    if (/\.(db|sqlite|sqlite3|sqlitedb)$/i.test(filePath)) {
-      logAction(config, "FILE_DELETE", filePath, true);
-      ctx.ui.notify(
-        `\n[BLOCKED] 禁止删除数据库文件: ${filePath}\n\n` +
-        `如确需删除，请手动操作并承担风险。`,
-        "error"
-      );
-      event.preventDefault?.();
-      return { allowed: false };
-    }
-
-    // 检查受保护路径
-    for (const protectedPath of config.protectedPaths) {
-      if (filePath.includes(protectedPath)) {
-        logAction(config, "FILE_DELETE_PROTECTED", filePath, true);
-        ctx.ui.notify(
-          `\n[BLOCKED] 禁止删除受保护路径下的文件: ${filePath}`,
-          "error"
-        );
-        event.preventDefault?.();
-        return { allowed: false };
-      }
-    }
-
-    return { allowed: true };
-  });
 
   // ============================================================
   // 命令：/no-delete-db status
@@ -545,28 +529,36 @@ export default function (pi: ExtensionAPI) {
   // ============================================================
   pi.registerTool({
     name: "check_database_command",
+    label: "Check DB Command",
     description: "检查命令是否会删除数据库或数据。用于在执行前验证命令的安全性。",
     parameters: Type.Object({
       command: Type.String({ description: "要检查的命令" }),
     }),
-    handler: async (args: { command: string }) => {
+    execute: async (_toolCallId, args: { command: string }) => {
       const result = checkCommand(args.command, config);
 
       if (result.matched) {
         return {
-          safe: false,
-          matched: true,
-          pattern: result.pattern?.name,
-          severity: result.pattern?.severity,
-          reason: result.reason,
-          description: result.pattern?.description,
+          content: [
+            {
+              type: "text",
+              text: `[BLOCKED] ${result.reason || "检测到危险操作"}\n描述: ${result.pattern?.description || ""}`,
+            },
+          ],
+          details: {
+            safe: false,
+            matched: true,
+            pattern: result.pattern?.name,
+            severity: result.pattern?.severity,
+            reason: result.reason,
+            description: result.pattern?.description,
+          },
         };
       }
 
       return {
-        safe: true,
-        matched: false,
-        message: "命令安全，未检测到删除操作",
+        content: [{ type: "text", text: "命令安全，未检测到删除操作" }],
+        details: { safe: true, matched: false },
       };
     },
   });

@@ -42,7 +42,6 @@ interface SubagentTask {
   result?: string;
   startTime?: number;
   endTime?: number;
-  workerId?: string;
 }
 
 interface SubagentResult {
@@ -93,15 +92,10 @@ function loadAllTasks(): SubagentTask[] {
 // 核心逻辑
 // ============================================================
 
-async function executeSubagentTask(
-  pi: ExtensionAPI,
-  task: string,
-  ctx: any
-): Promise<SubagentResult> {
+async function executeSubagentTask(pi: ExtensionAPI, task: string, ctx: any): Promise<SubagentResult> {
   const id = generateId();
   const startTime = Date.now();
 
-  // 创建子代理任务
   const subTask: SubagentTask = {
     id,
     parentSessionId: ctx.sessionId || "default",
@@ -113,32 +107,15 @@ async function executeSubagentTask(
   saveTask(subTask);
 
   try {
-    // 模拟子代理执行（实际可以调用 LLM）
-    // 在真实实现中，这里应该启动一个新的 Pi session 处理这个任务
-    //
-    // 例如：
-    // const subCtx = await pi.createSubSession({
-    //   task: task,
-    //   parent: ctx.sessionId,
-    // });
-    //
-    // const result = await subCtx.run();
-
-    // 占位实现 - 真实场景中替换为实际子代理调用
-    const result = `[子代理 ${id}] 已完成任务: ${task}\n\n执行时间: ${Date.now() - startTime}ms\n\n（这是模拟结果，实际使用需要接入 Pi 的子会话 API）`;
+    // 占位实现 - 真实场景中应接入 Pi 的子会话 API
+    const result = `[子代理 ${id}] 已完成任务: ${task}\n\n执行时间: ${Date.now() - startTime}ms\n\n（这是模拟结果）`;
 
     subTask.status = "completed";
     subTask.result = result;
     subTask.endTime = Date.now();
     saveTask(subTask);
 
-    const subResult: SubagentResult = {
-      id,
-      task,
-      result,
-      duration: subTask.endTime - startTime,
-      success: true,
-    };
+    const subResult: SubagentResult = { id, task, result, duration: subTask.endTime - startTime, success: true };
     results.set(id, subResult);
 
     return subResult;
@@ -148,13 +125,7 @@ async function executeSubagentTask(
     subTask.result = `Error: ${err}`;
     saveTask(subTask);
 
-    return {
-      id,
-      task,
-      result: `Error: ${err}`,
-      duration: Date.now() - startTime,
-      success: false,
-    };
+    return { id, task, result: `Error: ${err}`, duration: Date.now() - startTime, success: false };
   }
 }
 
@@ -164,44 +135,27 @@ async function executeSubagentTask(
 
 export default function (pi: ExtensionAPI) {
   console.log("[MultiHop-SubAgent] 子代理协作扩展已加载");
-  console.log(`[MultiHop-SubAgent] 任务目录: ${SUBAGENT_DIR}`);
 
   // ============================================================
   // 派生子代理
   // ============================================================
 
-  pi.registerCommand({
-    name: "spawn-subagent",
+  pi.registerCommand("spawn-subagent", {
     description: "派生子代理处理子任务",
-    async execute(ctx) {
-      const args = ctx.args || [];
-      if (args.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "❌ 请提供任务描述\n\n用法: /spawn-subagent <任务>",
-            },
-          ],
-        };
+    handler: async (args, ctx) => {
+      if (!args || args.length === 0) {
+        ctx.ui.notify("❌ 请提供任务描述\n\n用法: /spawn-subagent <任务>", "warning");
+        return;
       }
 
       const task = args.join(" ");
       const result = await executeSubagentTask(pi, task, ctx);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: result.success
-              ? `✅ 子代理完成任务\n\n` +
-                  `任务: ${task}\n` +
-                  `结果: ${result.result}\n` +
-                  `耗时: ${result.duration}ms`
-              : `❌ 子代理失败\n\n${result.result}`,
-          },
-        ],
-      };
+      if (result.success) {
+        ctx.ui.notify(`✅ 子代理完成任务\n\n任务: ${task}\n结果: ${result.result}\n耗时: ${result.duration}ms`, "info");
+      } else {
+        ctx.ui.notify(`❌ 子代理失败\n\n${result.result}`, "error");
+      }
     },
   });
 
@@ -209,55 +163,34 @@ export default function (pi: ExtensionAPI) {
   // 并行派发
   // ============================================================
 
-  pi.registerCommand({
-    name: "spawn-parallel",
+  pi.registerCommand("spawn-parallel", {
     description: "并行派发多个子代理任务",
-    async execute(ctx) {
-      const args = ctx.args || [];
-
-      if (args.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                "❌ 请提供多个任务\n\n" +
-                "用法: /spawn-parallel <任务1> || <任务2> || <任务3>\n\n" +
-                "用 || 分隔不同任务",
-            },
-          ],
-        };
+    handler: async (args, ctx) => {
+      if (!args || args.length === 0) {
+        ctx.ui.notify("❌ 请提供多个任务\n\n用法: /spawn-parallel <任务1> || <任务2> || <任务3>", "warning");
+        return;
       }
 
       const query = args.join(" ");
       const taskList = query.split("||").map((t) => t.trim()).filter((t) => t.length > 0);
 
       if (taskList.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "❌ 没有有效任务",
-            },
-          ],
-        };
+        ctx.ui.notify("❌ 没有有效任务", "warning");
+        return;
       }
 
-      // 并行执行
-      const promises = taskList.map((task) => executeSubagentTask(pi, task, ctx));
-      const results = await Promise.all(promises);
+      const parallelResults = await Promise.all(taskList.map((task) => executeSubagentTask(pi, task, ctx)));
 
-      let message = `✅ 并行执行 ${results.length} 个任务完成\n\n`;
-
-      for (let i = 0; i < results.length; i++) {
-        const r = results[i];
+      let message = `✅ 并行执行 ${parallelResults.length} 个任务完成\n\n`;
+      for (let i = 0; i < parallelResults.length; i++) {
+        const r = parallelResults[i];
         const icon = r.success ? "✅" : "❌";
         message += `${icon} [${i + 1}] ${r.task}\n`;
         message += `   耗时: ${r.duration}ms\n`;
         message += `   结果: ${r.result.substring(0, 100)}${r.result.length > 100 ? "..." : ""}\n\n`;
       }
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
@@ -265,35 +198,20 @@ export default function (pi: ExtensionAPI) {
   // 查看子代理状态
   // ============================================================
 
-  pi.registerCommand({
-    name: "subagent-status",
+  pi.registerCommand("subagent-status", {
     description: "查看子代理状态",
-    async execute(ctx) {
+    handler: async (_args, ctx) => {
       const sessionId = ctx.sessionId || "default";
       const allTasks = loadAllTasks();
       const sessionTasks = allTasks.filter((t) => t.parentSessionId === sessionId);
 
       if (sessionTasks.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "ℹ️ 当前会话还没有派生子代理",
-            },
-          ],
-        };
+        ctx.ui.notify("ℹ️ 当前会话还没有派生子代理", "info");
+        return;
       }
 
-      const byStatus = {
-        pending: 0,
-        running: 0,
-        completed: 0,
-        failed: 0,
-      };
-
-      for (const t of sessionTasks) {
-        byStatus[t.status]++;
-      }
+      const byStatus = { pending: 0, running: 0, completed: 0, failed: 0 };
+      for (const t of sessionTasks) byStatus[t.status]++;
 
       let message = `🤖 子代理状态\n\n`;
       message += `总任务: ${sessionTasks.length}\n`;
@@ -302,10 +220,8 @@ export default function (pi: ExtensionAPI) {
       message += `  ✅ 已完成: ${byStatus.completed}\n`;
       message += `  ❌ 失败: ${byStatus.failed}\n\n`;
 
-      // 显示最近 5 个
       const recent = sessionTasks.slice(0, 5);
       message += `最近 ${recent.length} 个任务:\n\n`;
-
       for (const t of recent) {
         const duration = t.endTime ? `${t.endTime - t.startTime}ms` : "进行中";
         message += `• ${t.id}\n`;
@@ -313,64 +229,36 @@ export default function (pi: ExtensionAPI) {
         message += `  状态: ${t.status} | 耗时: ${duration}\n\n`;
       }
 
-      return { content: [{ type: "text", text: message }] };
+      ctx.ui.notify(message, "info");
     },
   });
 
   // ============================================================
-  // 协调器 - Multi-Agent 编排
+  // 协调器
   // ============================================================
 
-  pi.registerCommand({
-    name: "orchestrate",
+  pi.registerCommand("orchestrate", {
     description: "编排多个子代理完成复杂任务",
-    async execute(ctx) {
-      const args = ctx.args || [];
-      if (args.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                "❌ 请提供主任务\n\n" +
-                "用法: /orchestrate <主任务>\n\n" +
-                "系统会自动分解为子任务并协调子代理",
-            },
-          ],
-        };
+    handler: async (args, ctx) => {
+      if (!args || args.length === 0) {
+        ctx.ui.notify("❌ 请提供主任务\n\n用法: /orchestrate <主任务>", "warning");
+        return;
       }
 
       const mainTask = args.join(" ");
-
-      // 任务分解（简化版）
       const subtasks = decomposeTask(mainTask);
 
-      ctx.ui.notify(
-        `🎭 [Orchestrator] 分解为 ${subtasks.length} 个子任务，开始协调执行`,
-        "info"
-      );
+      ctx.ui.notify(`🎭 [Orchestrator] 分解为 ${subtasks.length} 个子任务，开始协调执行`, "info");
 
-      // 并行执行子任务
-      const subResults = await Promise.all(
-        subtasks.map((task) => executeSubagentTask(pi, task, ctx))
-      );
-
-      // 综合结果
+      const subResults = await Promise.all(subtasks.map((task) => executeSubagentTask(pi, task, ctx)));
       const synthesis = synthesizeResults(mainTask, subResults);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: synthesis,
-          },
-        ],
-      };
+      ctx.ui.notify(synthesis, "info");
     },
   });
 
   // ============================================================
-  // 注册子代理工具（供 LLM 使用）
+  // 注册子代理工具
   // ============================================================
 
   pi.registerTool({
@@ -378,25 +266,13 @@ export default function (pi: ExtensionAPI) {
     description: "派生子代理处理子任务",
     parameters: {
       type: "object",
-      properties: {
-        task: {
-          type: "string",
-          description: "要子代理完成的任务描述",
-        },
-      },
+      properties: { task: { type: "string", description: "要子代理完成的任务描述" } },
       required: ["task"],
     },
-    async execute(args: { task: string }, ctx) {
+    handler: async (args: { task: string }, ctx) => {
       const result = await executeSubagentTask(pi, args.task, ctx);
       return {
-        content: [
-          {
-            type: "text",
-            text: result.success
-              ? `子代理完成: ${result.result}`
-              : `子代理失败: ${result.result}`,
-          },
-        ],
+        content: [{ type: "text", text: result.success ? `子代理完成: ${result.result}` : `子代理失败: ${result.result}` }],
       };
     },
   });
@@ -406,69 +282,37 @@ export default function (pi: ExtensionAPI) {
     description: "并行派发多个子代理",
     parameters: {
       type: "object",
-      properties: {
-        tasks: {
-          type: "array",
-          items: { type: "string" },
-          description: "多个任务描述",
-        },
-      },
+      properties: { tasks: { type: "array", items: { type: "string" }, description: "多个任务描述" } },
       required: ["tasks"],
     },
-    async execute(args: { tasks: string[] }, ctx) {
-      const promises = args.tasks.map((task) =>
-        executeSubagentTask(pi, task, ctx)
-      );
-      const results = await Promise.all(promises);
-
-      const summary = results
-        .map(
-          (r, i) =>
-            `[${i + 1}] ${r.success ? "✅" : "❌"} ${r.task}\n   → ${r.result.substring(0, 200)}`
-        )
-        .join("\n\n");
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `并行执行 ${results.length} 个子代理完成:\n\n${summary}`,
-          },
-        ],
-      };
+    handler: async (args: { tasks: string[] }, ctx) => {
+      const parallelResults = await Promise.all(args.tasks.map((task) => executeSubagentTask(pi, task, ctx)));
+      const summary = parallelResults.map((r, i) => `[${i + 1}] ${r.success ? "✅" : "❌"} ${r.task}\n   → ${r.result.substring(0, 200)}`).join("\n\n");
+      return { content: [{ type: "text", text: `并行执行 ${parallelResults.length} 个子代理完成:\n\n${summary}` }] };
     },
   });
 }
 
 // ============================================================
-// 任务分解（简化实现）
+// 任务分解
 // ============================================================
 
 function decomposeTask(mainTask: string): string[] {
-  // 实际实现中可以用 LLM 分解任务
-  // 这里提供简单的模式匹配
   const subtasks: string[] = [];
 
-  // 模式 1: "分析 X 和 Y"
   if (mainTask.includes("和") || mainTask.includes("与")) {
     const parts = mainTask.split(/[和与]/);
     for (const part of parts) {
-      if (part.trim().length > 0) {
-        subtasks.push(`分析: ${part.trim()}`);
-      }
+      if (part.trim().length > 0) subtasks.push(`分析: ${part.trim()}`);
     }
   }
 
-  // 模式 2: "研究 X"
   if (mainTask.includes("研究")) {
     subtasks.push(`收集资料: ${mainTask.replace("研究", "").trim()}`);
     subtasks.push(`总结发现: ${mainTask.replace("研究", "").trim()}`);
   }
 
-  // 默认：单任务
-  if (subtasks.length === 0) {
-    subtasks.push(mainTask);
-  }
+  if (subtasks.length === 0) subtasks.push(mainTask);
 
   return subtasks;
 }
@@ -478,18 +322,12 @@ function synthesizeResults(mainTask: string, results: SubagentResult[]): string 
   synthesis += `主任务: ${mainTask}\n`;
   synthesis += `子任务数: ${results.length}\n`;
   synthesis += `成功率: ${results.filter((r) => r.success).length}/${results.length}\n\n`;
-
   synthesis += `━━━ 各子代理结果 ━━━\n\n`;
   for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    synthesis += `[${i + 1}] ${r.task}\n`;
-    synthesis += `    ${r.result}\n\n`;
+    synthesis += `[${i + 1}] ${results[i].task}\n    ${results[i].result}\n\n`;
   }
-
   synthesis += `━━━ 综合结论 ━━━\n\n`;
-  synthesis += `根据 ${results.length} 个子代理的并行分析，`;
-  synthesis += `已完成对"${mainTask}"的协调处理。\n`;
+  synthesis += `根据 ${results.length} 个子代理的并行分析，已完成对"${mainTask}"的协调处理。\n`;
   synthesis += `总计耗时: ${Math.max(...results.map((r) => r.duration))}ms`;
-
   return synthesis;
 }
